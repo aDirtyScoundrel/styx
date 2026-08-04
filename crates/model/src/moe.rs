@@ -69,7 +69,8 @@ struct Layer {
     gate_exps: ExpMat,
     up_exps: ExpMat,
     down_exps: ExpMat,
-    remap: Buffer, // n_expert u32: expert -> dense hot idx, or SKIP (u32::MAX)
+    remap: Buffer,       // n_expert u32: expert -> dense hot idx, or SKIP (u32::MAX)
+    hot_mask: Vec<bool>, // host copy: expert -> pinned in VRAM?
     kcache: Buffer,
     vtcache: Buffer,
 }
@@ -121,6 +122,9 @@ pub struct MoeModel {
     batch: Option<Batch>,
     pub n_ctx_max: usize,
     n_past: usize,
+    /// Bytes of expert weights (gate+up+down) per (layer,expert) slab —
+    /// the PCIe cost of one cold expert hit.
+    pub slab_bytes: u64,
 }
 
 /// Scalar dequant of one q4_K block (ggml layout) — for host embedding rows.
@@ -431,6 +435,7 @@ impl MoeModel {
             }
             let remap = gpu.create_buffer((n_expert * 4) as u64, true)?;
             gpu.upload(&remap, as_bytes(&remap_vec))?;
+            let hot_mask: Vec<bool> = remap_vec.iter().map(|&r| r != u32::MAX).collect();
             layers.push(Layer {
                 attn_norm: upload_f32(&n("attn_norm"))?,
                 q_norm: upload_f32(&n("attn_q_norm"))?,
@@ -445,6 +450,7 @@ impl MoeModel {
                 up_exps: upload_exp(&n("ffn_up_exps"), l)?,
                 down_exps: upload_exp(&n("ffn_down_exps"), l)?,
                 remap,
+                hot_mask,
                 kcache: gpu.create_buffer((n_ctx_max * kv_dim * 4) as u64, true)?,
                 vtcache: gpu.create_buffer((n_ctx_max * kv_dim * 4) as u64, true)?,
             });
@@ -543,11 +549,31 @@ impl MoeModel {
             batch,
             n_ctx_max,
             n_past: 0,
+            slab_bytes: ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                .iter()
+                .map(|s| {
+                    let t = &tmap[&format!("blk.0.{s}.weight")];
+                    t.size_bytes / n_expert as u64
+                })
+                .sum(),
         })
     }
 
     pub fn reset(&mut self) {
         self.n_past = 0;
+    }
+
+    /// Telemetry for the last forwarded token: per-layer (hot_hits, cold_hits)
+    /// against the current pinning, derived from the original-id row of bids.
+    pub fn last_hot_cold(&self) -> Vec<(u32, u32)> {
+        self.last_expert_ids()
+            .iter()
+            .zip(&self.layers)
+            .map(|(ids, ly)| {
+                let hot = ids.iter().filter(|&&e| ly.hot_mask[e as usize]).count() as u32;
+                (hot, ids.len() as u32 - hot)
+            })
+            .collect()
     }
 
     fn rec_matvec_b(&self, batch: &mut Batch, w: &GpuMat, x: &Buffer, y: &Buffer, barrier: bool) {
