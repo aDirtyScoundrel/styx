@@ -26,6 +26,145 @@ pub struct Pipeline {
     pub n_bindings: u32,
 }
 
+/// One command buffer + its own descriptor pool + fence. Record many
+/// dispatches, then submit once. Not thread-safe; one per graph.
+pub struct Batch {
+    dpool: vk::DescriptorPool,
+    cb: vk::CommandBuffer,
+    fence: vk::Fence,
+    recording: bool,
+}
+
+impl Batch {
+    /// Must be called before the first dispatch in a new graph.
+    pub fn begin(&mut self, gpu: &Gpu) -> Result<(), String> {
+        assert!(!self.recording);
+        unsafe {
+            gpu.device
+                .begin_command_buffer(self.cb, &vk::CommandBufferBeginInfo::default())
+                .map_err(|e| e.to_string())?;
+        }
+        self.recording = true;
+        Ok(())
+    }
+
+    /// Record one dispatch. Buffers are bound sequentially to bindings 0..N.
+    /// The descriptor set is allocated from the batch's private pool.
+    pub fn dispatch(
+        &mut self,
+        gpu: &Gpu,
+        p: &Pipeline,
+        buffers: &[&Buffer],
+        push: &[u8],
+        groups: (u32, u32, u32),
+    ) -> Result<(), String> {
+        assert!(self.recording);
+        assert_eq!(buffers.len() as u32, p.n_bindings);
+        unsafe {
+            let layouts = [p.dset_layout];
+            let dset = gpu
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self.dpool)
+                        .set_layouts(&layouts),
+                )
+                .map_err(|e| e.to_string())?[0];
+
+            let infos: Vec<_> = buffers
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo::default()
+                        .buffer(b.buf)
+                        .range(vk::WHOLE_SIZE)]
+                })
+                .collect();
+            let writes: Vec<_> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(dset)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                })
+                .collect();
+            gpu.device.update_descriptor_sets(&writes, &[]);
+
+            gpu.device
+                .cmd_bind_pipeline(self.cb, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+            gpu.device.cmd_bind_descriptor_sets(
+                self.cb,
+                vk::PipelineBindPoint::COMPUTE,
+                p.layout,
+                0,
+                &[dset],
+                &[],
+            );
+            if !push.is_empty() {
+                gpu.device.cmd_push_constants(
+                    self.cb,
+                    p.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push,
+                );
+            }
+            gpu.device
+                .cmd_dispatch(self.cb, groups.0, groups.1, groups.2);
+            // Barrier: ensure writes from this dispatch are visible to next.
+            // Global memory barrier for all bound storage buffers.
+            gpu.device.cmd_pipeline_barrier(
+                self.cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+                &[],
+                &[],
+            );
+            Ok(())
+        }
+    }
+
+    /// Submit the recorded command buffer once, wait on its fence.
+    pub fn submit(&mut self, gpu: &Gpu) -> Result<(), String> {
+        if !self.recording {
+            return Ok(()); // no work
+        }
+        unsafe {
+            gpu.device
+                .end_command_buffer(self.cb)
+                .map_err(|e| e.to_string())?;
+            let cbs = [self.cb];
+            gpu.device
+                .queue_submit(
+                    gpu.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cbs)],
+                    self.fence,
+                )
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .reset_fences(&[self.fence])
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .reset_command_buffer(self.cb, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .reset_descriptor_pool(self.dpool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| e.to_string())?;
+            self.recording = false;
+            Ok(())
+        }
+    }
+}
+
 pub struct Gpu {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -414,6 +553,53 @@ impl Gpu {
         unsafe {
             self.device.destroy_buffer(b.buf, None);
             self.device.free_memory(b.mem, None);
+        }
+    }
+
+    /// Create a reusable batch recorder: many dispatches, one submit/fence.
+    /// `max_sets`/`max_descriptors` size its private descriptor pool — pick
+    /// them to cover one full recorded graph (e.g. a whole token).
+    pub fn create_batch(&self, max_sets: u32, max_descriptors: u32) -> Result<Batch, String> {
+        unsafe {
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(max_descriptors)];
+            let dpool = self
+                .device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(max_sets)
+                        .pool_sizes(&pool_sizes),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let cb = self
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .map_err(|e| e.to_string())?[0];
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| e.to_string())?;
+            Ok(Batch {
+                dpool,
+                cb,
+                fence,
+                recording: false,
+            })
+        }
+    }
+
+    pub fn destroy_batch(&self, b: Batch) {
+        unsafe {
+            self.device.destroy_fence(b.fence, None);
+            self.device.free_command_buffers(self.cmd_pool, &[b.cb]);
+            self.device.destroy_descriptor_pool(b.dpool, None);
         }
     }
 

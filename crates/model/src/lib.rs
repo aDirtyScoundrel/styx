@@ -8,7 +8,7 @@ use gguf_rs::Gguf;
 use std::collections::HashMap;
 use std::path::Path;
 use vk_backend::ops::MatVecPush;
-use vk_backend::{Buffer, Gpu, Pipeline};
+use vk_backend::{Batch, Buffer, Gpu, Pipeline};
 
 const Q8_BLOCK: usize = 34;
 const Q8_K: usize = 32;
@@ -64,6 +64,8 @@ pub struct Model {
     vcache: Vec<Vec<f32>>,
     pub n_ctx_max: usize,
     n_past: usize,
+    // Graph recorder for one token (prefill or decode step).
+    batch: Option<Batch>,
 }
 
 fn dequant_q8_0_row(raw: &[u8], row: usize, ncols: usize, out: &mut [f32]) {
@@ -205,6 +207,8 @@ impl Model {
         let n_layers = hp.n_layers;
         let n_ctx_max = 4096usize;
         let kv_dim = hp.n_kv_heads * hp.head_dim;
+        // Batch: size for ~196 dispatches per token (prefill=9 -> ~1700 sets, decode=1 -> ~200).
+        let batch = Some(gpu.create_batch(2048, 2048)?);
         Ok(Model {
             hp,
             gpu,
@@ -221,6 +225,7 @@ impl Model {
             vcache: vec![vec![0f32; n_ctx_max * kv_dim]; n_layers],
             n_ctx_max,
             n_past: 0,
+            batch,
         })
     }
 
@@ -257,10 +262,6 @@ impl Model {
             .unwrap();
     }
 
-    pub fn reset(&mut self) {
-        self.n_past = 0;
-    }
-
     /// Feed one token at position = current cache length. Returns logits.
     pub fn forward_token(&mut self, token: u32) -> Vec<f32> {
         let hp = &self.hp;
@@ -288,6 +289,7 @@ impl Model {
         let mut gate = vec![0f32; self.hp.n_ff];
         let mut up = vec![0f32; self.hp.n_ff];
 
+        let batch = self.batch.as_mut().unwrap();
         for l in 0..self.hp.n_layers {
             let ly = &self.layers[l];
             // --- attention ---
@@ -385,5 +387,19 @@ impl Model {
             );
         }
         logits
+    }
+}
+
+impl Model {
+    pub fn reset(&mut self) {
+        self.n_past = 0;
+    }
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        if let Some(b) = self.batch.take() {
+            self.gpu.destroy_batch(b);
+        }
     }
 }
