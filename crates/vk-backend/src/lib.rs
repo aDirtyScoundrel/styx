@@ -74,6 +74,21 @@ impl Batch {
         push: &[u8],
         groups: (u32, u32, u32),
     ) -> Result<(), String> {
+        self.dispatch_ranges_barrier(gpu, p, buffers, push, groups, true)
+    }
+
+    /// `barrier=false` skips the trailing compute->compute barrier; use for
+    /// dispatches whose outputs are not read by the IMMEDIATELY following
+    /// dispatch (e.g. q/k/v or gate/up sibling matvecs).
+    pub fn dispatch_ranges_barrier(
+        &mut self,
+        gpu: &Gpu,
+        p: &Pipeline,
+        buffers: &[(&Buffer, u64, u64)],
+        push: &[u8],
+        groups: (u32, u32, u32),
+        barrier: bool,
+    ) -> Result<(), String> {
         assert!(self.recording);
         assert_eq!(buffers.len() as u32, p.n_bindings);
         unsafe {
@@ -132,17 +147,19 @@ impl Batch {
                 .cmd_dispatch(self.cb, groups.0, groups.1, groups.2);
             // Barrier: ensure writes from this dispatch are visible to next.
             // Global memory barrier for all bound storage buffers.
-            gpu.device.cmd_pipeline_barrier(
-                self.cb,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)],
-                &[],
-                &[],
-            );
+            if barrier {
+                gpu.device.cmd_pipeline_barrier(
+                    self.cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+                    &[],
+                    &[],
+                );
+            }
             Ok(())
         }
     }

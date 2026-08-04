@@ -186,13 +186,13 @@ impl Model {
             &spv("mul_mat_vec_q8_0_f32_f32"),
             5,
             mmv_pc,
-            &[(0, 32), (1, 1), (2, 1)],
+            &[(0, 64), (1, 2), (2, 1)],
         )?;
         let mmv4 = gpu.create_pipeline(
             &spv("mul_mat_vec_q8_0_f32_f32"),
             5,
             mmv_pc,
-            &[(0, 32), (1, 4), (2, 1)],
+            &[(0, 64), (1, 4), (2, 1)],
         )?;
         let strided_spv: PathBuf = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -345,17 +345,23 @@ impl Model {
 
     /// Record y = W · x (W q8_0). Whole-buffer bindings.
     fn rec_matvec(&self, batch: &mut Batch, w: &GpuMat, x: &Buffer, y: &Buffer) {
+        self.rec_matvec_b(batch, w, x, y, true)
+    }
+
+    /// Like rec_matvec but with control over the trailing barrier (false when
+    /// the next dispatch does not read `y`).
+    fn rec_matvec_b(&self, batch: &mut Batch, w: &GpuMat, x: &Buffer, y: &Buffer, barrier: bool) {
         let (pipe, num_rows) = if w.nrows % 4 == 0 && w.nrows / 4 > 4096 {
             (&self.mmv4, 4usize)
         } else {
-            (&self.mmv1, 1)
+            (&self.mmv1, 2)
         };
         let groups = (w.nrows / num_rows) as u32;
         assert!(groups <= 65535, "workgroup overflow: {groups}");
         let mut push = MatVecPush::simple(w.ncols as u32, w.nrows as u32);
         push.stride_a = (w.ncols / Q8_K) as u32;
         batch
-            .dispatch_ranges(
+            .dispatch_ranges_barrier(
                 &self.gpu,
                 pipe,
                 &[
@@ -367,6 +373,7 @@ impl Model {
                 ],
                 push.as_bytes(),
                 (groups, 1, 1),
+                barrier,
             )
             .unwrap();
     }
@@ -462,8 +469,8 @@ impl Model {
             if l == 0 {
                 probe!(&self.bnorm, n_embd, "attn_norm-0");
             }
-            self.rec_matvec(&mut batch, &ly.wq, &self.bnorm, &self.bq);
-            self.rec_matvec(&mut batch, &ly.wk, &self.bnorm, &self.bk);
+            self.rec_matvec_b(&mut batch, &ly.wq, &self.bnorm, &self.bq, false);
+            self.rec_matvec_b(&mut batch, &ly.wk, &self.bnorm, &self.bk, false);
             self.rec_matvec(&mut batch, &ly.wv, &self.bnorm, &self.bv);
             if l == 0 {
                 probe!(&self.bq, n_heads * hd, "Qcur-0");
@@ -579,7 +586,7 @@ impl Model {
                 n_embd as u32,
                 1,
             );
-            self.rec_matvec(&mut batch, &ly.w_gate, &self.bnorm, &self.bgate);
+            self.rec_matvec_b(&mut batch, &ly.w_gate, &self.bnorm, &self.bgate, false);
             self.rec_matvec(&mut batch, &ly.w_up, &self.bnorm, &self.bup);
             if l == 0 {
                 probe!(&self.bnorm, n_embd, "ffn_norm-0");
