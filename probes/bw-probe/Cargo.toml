@@ -6,5 +6,3 @@ edition = "2021"
 [dependencies]
 ash = "0.38"
 
-[profile.release]
-debug = false
