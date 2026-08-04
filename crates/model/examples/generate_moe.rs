@@ -109,5 +109,12 @@ fn main() {
             })
             .collect();
         eprintln!("hud: cold/layer [{glyphs}] (.=0%, 9=90%+ of k={k} slots)");
+        if m.repin_swaps > 0 {
+            eprintln!(
+                "hud: repin {} slab swaps (~{:.2} GiB copied)",
+                m.repin_swaps,
+                (m.repin_swaps * m.slab_bytes) as f64 / (1u64 << 30) as f64
+            );
+        }
     }
 }

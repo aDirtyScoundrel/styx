@@ -659,6 +659,36 @@ impl Gpu {
         Ok(())
     }
 
+    /// Mapped copy between two host-visible, non-sparse buffers at byte
+    /// offsets. Used by online expert repinning (cold GTT slab -> hot
+    /// VRAM slot) without staging through a host Vec.
+    pub fn copy_region(
+        &self,
+        src: &Buffer,
+        src_off: u64,
+        dst: &Buffer,
+        dst_off: u64,
+        len: u64,
+    ) -> Result<(), String> {
+        assert!(src.host_visible && dst.host_visible);
+        assert!(src.sparse.is_none() && dst.sparse.is_none());
+        assert!(src_off + len <= src.size && dst_off + len <= dst.size);
+        unsafe {
+            let s = self
+                .device
+                .map_memory(src.mem, src_off, len, vk::MemoryMapFlags::empty())
+                .map_err(|e| e.to_string())?;
+            let d = self
+                .device
+                .map_memory(dst.mem, dst_off, len, vk::MemoryMapFlags::empty())
+                .map_err(|e| e.to_string())?;
+            std::ptr::copy_nonoverlapping(s as *const u8, d as *mut u8, len as usize);
+            self.device.unmap_memory(src.mem);
+            self.device.unmap_memory(dst.mem);
+        }
+        Ok(())
+    }
+
     /// Load a SPIR-V compute pipeline with `n_bindings` storage buffers,
     /// a push-constant range of `push_bytes`, and u32 specialization
     /// constants `(constant_id, value)`.

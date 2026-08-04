@@ -51,6 +51,7 @@ struct ExpMat {
     nrows: usize, // per expert
     ncols: usize,
     ggml_type: u32,
+    slab: usize, // bytes per expert slab
     // Dense hot buffer: hottest experts' slabs copied contiguously into VRAM
     // (plus one trailing zero slab), ids remapped by the router shader.
     hot: Option<Buffer>,
@@ -69,8 +70,11 @@ struct Layer {
     gate_exps: ExpMat,
     up_exps: ExpMat,
     down_exps: ExpMat,
-    remap: Buffer,       // n_expert u32: expert -> dense hot idx, or SKIP (u32::MAX)
-    hot_mask: Vec<bool>, // host copy: expert -> pinned in VRAM?
+    remap: Buffer,          // n_expert u32: expert -> dense hot idx, or SKIP (u32::MAX)
+    hot_mask: Vec<bool>,    // host copy: expert -> pinned in VRAM?
+    remap_vec: Vec<u32>,    // host copy of remap
+    slot_experts: Vec<u32>, // hot slot -> expert currently resident
+    hits: Vec<u64>,         // online per-expert hit counters (repinning)
     kcache: Buffer,
     vtcache: Buffer,
 }
@@ -129,6 +133,13 @@ pub struct MoeModel {
     /// Bytes of expert weights (gate+up+down) per (layer,expert) slab —
     /// the PCIe cost of one cold expert hit.
     pub slab_bytes: u64,
+    /// Online repinning: every N tokens swap the coldest resident experts
+    /// for the hottest non-resident ones (MOE_REPIN_INTERVAL; 0/unset off).
+    repin_interval: usize,
+    /// Max slab swaps per layer per repin event (MOE_REPIN_MAX, default 2).
+    repin_max: usize,
+    /// Total expert slabs swapped in by repinning so far.
+    pub repin_swaps: u64,
 }
 
 /// Paged-KV page size in tokens. One page = KV_PAGE_TOKENS*kv_dim*4 bytes
@@ -407,6 +418,7 @@ impl MoeModel {
                 ncols: t.dims[0] as usize,
                 nrows: t.dims[1] as usize,
                 ggml_type: t.ggml_type,
+                slab: (t.size_bytes / n_expert as u64) as usize,
                 hot,
             })
         };
@@ -444,6 +456,8 @@ impl MoeModel {
             let remap = gpu.create_buffer((n_expert * 4) as u64, true)?;
             gpu.upload(&remap, as_bytes(&remap_vec))?;
             let hot_mask: Vec<bool> = remap_vec.iter().map(|&r| r != u32::MAX).collect();
+            let slot_experts: Vec<u32> =
+                hot_order.as_ref().map(|o| o[l].clone()).unwrap_or_default();
             layers.push(Layer {
                 attn_norm: upload_f32(&n("attn_norm"))?,
                 q_norm: upload_f32(&n("attn_q_norm"))?,
@@ -459,6 +473,9 @@ impl MoeModel {
                 down_exps: upload_exp(&n("ffn_down_exps"), l)?,
                 remap,
                 hot_mask,
+                remap_vec,
+                slot_experts,
+                hits: vec![0u64; n_expert],
                 // Paged KV: start with one page, grown on demand in
                 // forward_token (copy-on-grow at page boundaries).
                 kcache: gpu.create_buffer((KV_PAGE_TOKENS * kv_dim * 4) as u64, true)?,
@@ -560,6 +577,15 @@ impl MoeModel {
             n_ctx_max,
             n_past: 0,
             kv_cap: KV_PAGE_TOKENS,
+            repin_interval: std::env::var("MOE_REPIN_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            repin_max: std::env::var("MOE_REPIN_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+            repin_swaps: 0,
             slab_bytes: ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
                 .iter()
                 .map(|s| {
@@ -572,6 +598,72 @@ impl MoeModel {
 
     pub fn reset(&mut self) {
         self.n_past = 0;
+    }
+
+    /// Online repinning: fold the last token's routed experts into per-layer
+    /// hit counters; every `repin_interval` tokens, for each layer swap
+    /// resident experts out for non-resident ones with strictly more hits
+    /// (cold GTT slab -> hot VRAM slot via mapped copy, remap table updated).
+    /// Requires the previous submit to have completed (bids readback and the
+    /// hot buffers are idle between forward_token calls).
+    fn maybe_repin(&mut self) {
+        if self.repin_interval == 0 {
+            return;
+        }
+        let ids = self.last_expert_ids();
+        for (l, row) in ids.iter().enumerate() {
+            for &e in row {
+                self.layers[l].hits[e as usize] += 1;
+            }
+        }
+        if self.n_past % self.repin_interval != 0 {
+            return;
+        }
+        for ly in &mut self.layers {
+            let n_slots = ly.slot_experts.len();
+            if n_slots == 0 {
+                continue;
+            }
+            // residents ranked coldest-first, outsiders hottest-first
+            let mut res: Vec<usize> = (0..n_slots).collect();
+            res.sort_unstable_by_key(|&s| ly.hits[ly.slot_experts[s] as usize]);
+            let mut out: Vec<u32> = (0..ly.hot_mask.len() as u32)
+                .filter(|&e| !ly.hot_mask[e as usize])
+                .collect();
+            out.sort_unstable_by_key(|&e| std::cmp::Reverse(ly.hits[e as usize]));
+            let mut dirty = false;
+            // Throttle: at most MOE_REPIN_MAX swaps per layer per event, and
+            // require a 2x hit margin (hysteresis) so borderline experts
+            // don't ping-pong — each swap costs a ~15 MiB PCIe copy.
+            for (&slot, &newcomer) in res.iter().zip(out.iter()).take(self.repin_max) {
+                let old = ly.slot_experts[slot];
+                if ly.hits[newcomer as usize] < 2 * ly.hits[old as usize].max(1) {
+                    break; // ranked lists: no further profitable swap
+                }
+                for m in [&ly.gate_exps, &ly.up_exps, &ly.down_exps] {
+                    let hot = m.hot.as_ref().unwrap();
+                    self.gpu
+                        .copy_region(
+                            &m.buf,
+                            newcomer as u64 * m.slab as u64,
+                            hot,
+                            slot as u64 * m.slab as u64,
+                            m.slab as u64,
+                        )
+                        .unwrap();
+                }
+                ly.remap_vec[old as usize] = u32::MAX;
+                ly.remap_vec[newcomer as usize] = slot as u32;
+                ly.hot_mask[old as usize] = false;
+                ly.hot_mask[newcomer as usize] = true;
+                ly.slot_experts[slot] = newcomer;
+                self.repin_swaps += 1;
+                dirty = true;
+            }
+            if dirty {
+                self.gpu.upload(&ly.remap, as_bytes(&ly.remap_vec)).unwrap();
+            }
+        }
     }
 
     /// Telemetry for the last forwarded token: per-layer (hot_hits, cold_hits)
@@ -726,6 +818,11 @@ impl MoeModel {
     }
 
     pub fn forward_token(&mut self, token: u32) -> Vec<f32> {
+        // Online repinning: previous token's bids are final and the GPU is
+        // idle between forward_token calls — safe to rewrite hot slabs/remap.
+        if self.n_past > 0 {
+            self.maybe_repin();
+        }
         let hp = &self.hp;
         let (n_embd, n_heads, n_kv, hd) = (
             hp.base.n_embd,
