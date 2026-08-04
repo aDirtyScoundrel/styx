@@ -317,6 +317,18 @@ impl Gpu {
         })
     }
 
+    fn find_mem_type_not(
+        &self,
+        bits: u32,
+        want: vk::MemoryPropertyFlags,
+        avoid: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        (0..self.mem_props.memory_type_count).find(|&i| {
+            let f = self.mem_props.memory_types[i as usize].property_flags;
+            (bits & (1 << i)) != 0 && f.contains(want) && !f.intersects(avoid)
+        })
+    }
+
     pub fn create_buffer(&self, size: u64, host_visible: bool) -> Result<Buffer, String> {
         unsafe {
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER
@@ -367,6 +379,49 @@ impl Gpu {
                 mem,
                 size,
                 host_visible,
+            })
+        }
+    }
+
+    /// Host-memory (GTT) buffer: HOST_VISIBLE but explicitly NOT device-local.
+    /// The GPU reads it over PCIe. For oversize weights (expert streaming).
+    pub fn create_buffer_host(&self, size: u64) -> Result<Buffer, String> {
+        unsafe {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST;
+            let buf = self
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(size).usage(usage),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let mt = self
+                .find_mem_type_not(
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+                .ok_or("no host-only memory type")?;
+            let mem = self
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(mt),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            self.device
+                .bind_buffer_memory(buf, mem, 0)
+                .map_err(|e| e.to_string())?;
+            Ok(Buffer {
+                buf,
+                mem,
+                size,
+                host_visible: true,
             })
         }
     }

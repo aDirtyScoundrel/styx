@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use vk_backend::ops::{BinaryPush, GluPush, MatVecPush, RopePush, SoftMaxPush, UnaryPush};
 use vk_backend::{Batch, Buffer, Gpu, Pipeline};
 
+pub mod moe;
+pub use moe::MoeModel;
+
 const Q8_BLOCK: usize = 34;
 const Q8_K: usize = 32;
 
@@ -114,15 +117,15 @@ fn as_bytes_of<T>(v: &T) -> &[u8] {
 }
 
 #[repr(C)]
-struct AttnPush {
-    n_t: u32,
-    hd: u32,
-    kv_dim: u32,
-    gqa: u32,
-    scale: f32,
+pub(crate) struct AttnPush {
+    pub n_t: u32,
+    pub hd: u32,
+    pub kv_dim: u32,
+    pub gqa: u32,
+    pub scale: f32,
 }
 
-const WHOLE: u64 = u64::MAX; // vk::WHOLE_SIZE
+pub(crate) const WHOLE: u64 = u64::MAX; // vk::WHOLE_SIZE
 
 impl Model {
     pub fn load(path: &Path) -> Result<Model, String> {

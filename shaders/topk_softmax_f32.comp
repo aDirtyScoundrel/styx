@@ -1,0 +1,37 @@
+#version 450
+// Softmax over n logits, then top-k selection with renormalized weights
+// (Qwen3-MoE router: norm_topk_prob=true). Single workgroup; n <= 512.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform parameter { uint n; uint k; } p;
+layout(binding = 0) readonly buffer L { float logits[]; };
+layout(binding = 1) writeonly buffer W { float weights[]; };
+layout(binding = 2) writeonly buffer I { int ids[]; };
+
+void main() {
+    // serial: n=128 -> negligible vs the expert matvecs this gates
+    float mx = logits[0];
+    for (uint i = 1; i < p.n; ++i) mx = max(mx, logits[i]);
+    float sum = 0.0;
+    for (uint i = 0; i < p.n; ++i) sum += exp(logits[i] - mx);
+
+    float picked[16];
+    int pid[16];
+    float wsum = 0.0;
+    for (uint s = 0; s < p.k; ++s) {
+        float best = -1.0 / 0.0;
+        int bi = -1;
+        for (uint i = 0; i < p.n; ++i) {
+            bool taken = false;
+            for (uint t = 0; t < s; ++t) if (pid[t] == int(i)) taken = true;
+            if (!taken && logits[i] > best) { best = logits[i]; bi = int(i); }
+        }
+        float w = exp(best - mx) / sum;
+        picked[s] = w;
+        pid[s] = bi;
+        wsum += w;
+    }
+    for (uint s = 0; s < p.k; ++s) {
+        weights[s] = picked[s] / wsum;
+        ids[s] = pid[s];
+    }
+}

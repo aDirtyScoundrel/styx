@@ -1,0 +1,14 @@
+#version 450
+// MoE weighted reduce: x[i] += sum_s w[s] * d[s*ne + i]
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform parameter { uint ne; uint k; } p;
+layout(binding = 0) readonly buffer D { float data_d[]; };
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) buffer X { float x[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) return;
+    float acc = 0.0;
+    for (uint s = 0; s < p.k; ++s) acc += w[s] * data_d[s * p.ne + i];
+    x[i] += acc;
+}
