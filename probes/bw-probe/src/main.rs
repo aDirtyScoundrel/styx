@@ -51,17 +51,28 @@ impl Ctx {
                 && !f.contains(vk::QueueFlags::GRAPHICS)
                 && !f.contains(vk::QueueFlags::COMPUTE);
             if dedicated {
-                pick = Some((i as u32, format!("dedicated transfer (family {i}, flags {f:?})")));
+                pick = Some((
+                    i as u32,
+                    format!("dedicated transfer (family {i}, flags {f:?})"),
+                ));
                 break;
             }
         }
         let (qfam, qname) = pick.unwrap_or_else(|| {
             let i = qfams
                 .iter()
-                .position(|q| q.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                    || q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .position(|q| {
+                    q.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                        || q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                })
                 .unwrap() as u32;
-            (i, format!("fallback queue family {i} ({:?})", qfams[i as usize].queue_flags))
+            (
+                i,
+                format!(
+                    "fallback queue family {i} ({:?})",
+                    qfams[i as usize].queue_flags
+                ),
+            )
         });
         println!("queue:  {qname}");
 
@@ -74,10 +85,24 @@ impl Ctx {
         let queue = device.get_device_queue(qfam, 0);
         let mem_props = instance.get_physical_device_memory_properties(pdev);
 
-        Ctx { _entry: entry, instance, device, pdev, queue, qfam, qname, mem_props }
+        Ctx {
+            _entry: entry,
+            instance,
+            device,
+            pdev,
+            queue,
+            qfam,
+            qname,
+            mem_props,
+        }
     }
 
-    fn find_mem_type(&self, type_bits: u32, want: vk::MemoryPropertyFlags, avoid: vk::MemoryPropertyFlags) -> Option<u32> {
+    fn find_mem_type(
+        &self,
+        type_bits: u32,
+        want: vk::MemoryPropertyFlags,
+        avoid: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
         (0..self.mem_props.memory_type_count).find(|&i| {
             let mt = self.mem_props.memory_types[i as usize];
             (type_bits & (1 << i)) != 0
@@ -86,7 +111,13 @@ impl Ctx {
         })
     }
 
-    unsafe fn make_buffer(&self, size: u64, usage: vk::BufferUsageFlags, want: vk::MemoryPropertyFlags, avoid: vk::MemoryPropertyFlags) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+    unsafe fn make_buffer(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        want: vk::MemoryPropertyFlags,
+        avoid: vk::MemoryPropertyFlags,
+    ) -> Option<(vk::Buffer, vk::DeviceMemory)> {
         let bci = vk::BufferCreateInfo::default().size(size).usage(usage);
         let buf = self.device.create_buffer(&bci, None).ok()?;
         let req = self.device.get_buffer_memory_requirements(buf);
@@ -97,7 +128,9 @@ impl Ctx {
                 return None;
             }
         };
-        let mai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt);
+        let mai = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mt);
         let mem = match self.device.allocate_memory(&mai, None) {
             Ok(m) => m,
             Err(_) => {
@@ -111,7 +144,13 @@ impl Ctx {
 }
 
 // time N copy submissions of `size` bytes, return GB/s and per-copy ms
-unsafe fn bench_copy(ctx: &Ctx, src: vk::Buffer, dst: vk::Buffer, size: u64, iters: u32) -> (f64, f64) {
+unsafe fn bench_copy(
+    ctx: &Ctx,
+    src: vk::Buffer,
+    dst: vk::Buffer,
+    size: u64,
+    iters: u32,
+) -> (f64, f64) {
     let d = &ctx.device;
     let cpci = vk::CommandPoolCreateInfo::default()
         .queue_family_index(ctx.qfam)
@@ -123,7 +162,8 @@ unsafe fn bench_copy(ctx: &Ctx, src: vk::Buffer, dst: vk::Buffer, size: u64, ite
         .command_buffer_count(1);
     let cb = d.allocate_command_buffers(&cbai).unwrap()[0];
 
-    d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()).unwrap();
+    d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
+        .unwrap();
     let region = [vk::BufferCopy::default().size(size)];
     d.cmd_copy_buffer(cb, src, dst, &region);
     d.end_command_buffer(cb).unwrap();
@@ -170,29 +210,40 @@ fn main() {
 
         // host-visible staging (GTT, cached if available)
         let host_cached = ctx.make_buffer(
-            big, usage,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED,
+            big,
+            usage,
+            vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+                | vk::MemoryPropertyFlags::HOST_CACHED,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         );
         let host_uncached = ctx.make_buffer(
-            big, usage,
+            big,
+            usage,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_CACHED,
         );
         // device-local target
-        let (dbuf, dmem) = ctx.make_buffer(
-            big, usage,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
-        ).expect("device-local buffer");
+        let (dbuf, dmem) = ctx
+            .make_buffer(
+                big,
+                usage,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::HOST_VISIBLE,
+            )
+            .expect("device-local buffer");
         // ReBAR: device-local + host-visible
         let rebar = ctx.make_buffer(
-            big, usage,
+            big,
+            usage,
             vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
             vk::MemoryPropertyFlags::empty(),
         );
 
-        println!("\n== bulk copies, 256 MB x 10 iters, queue: {} ==", ctx.qname);
+        println!(
+            "\n== bulk copies, 256 MB x 10 iters, queue: {} ==",
+            ctx.qname
+        );
         if let Some((hbuf, _)) = host_cached {
             let (g, m) = bench_copy(&ctx, hbuf, dbuf, big, 10);
             println!("H2D (host-cached staging -> VRAM):   {g:6.2} GB/s  ({m:.2} ms / 256MB)");
@@ -218,7 +269,10 @@ fn main() {
             for sz_mb in [2u64, 8, 16, 32] {
                 let sz = sz_mb * MB;
                 let (g, m) = bench_copy(&ctx, hbuf, dbuf, sz, 50);
-                println!("H2D {sz_mb:>3} MB: {g:6.2} GB/s effective, {:.3} ms/copy", m);
+                println!(
+                    "H2D {sz_mb:>3} MB: {g:6.2} GB/s effective, {:.3} ms/copy",
+                    m
+                );
             }
         }
 

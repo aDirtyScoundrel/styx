@@ -9,6 +9,8 @@
 use ash::vk;
 use std::path::Path;
 
+pub mod ops;
+
 pub struct Buffer {
     pub buf: vk::Buffer,
     pub mem: vk::DeviceMemory,
