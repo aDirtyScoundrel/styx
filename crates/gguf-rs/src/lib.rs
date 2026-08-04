@@ -134,7 +134,9 @@ fn read_u64_le<R: Read>(reader: &mut R) -> IoResult<u64> {
 
 fn read_gguf_string<R: Read>(reader: &mut R) -> IoResult<String> {
     let len = read_u64_le(reader)? as usize;
-    if len > (1 << 32) {
+    // Real GGUF strings are keys/names/templates; cap well below the spec's
+    // theoretical limit so a corrupt length can't force a huge allocation.
+    if len > (1 << 24) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "String too long",
@@ -223,7 +225,8 @@ fn read_f64_le<R: Read>(reader: &mut R) -> IoResult<f64> {
 fn read_array<R: Read>(reader: &mut R) -> IoResult<Value> {
     let element_type = read_u32_le(reader)?;
     let count = read_u64_le(reader)? as usize;
-    if count > (1 << 32) {
+    // Largest real arrays are vocab/token lists (a few hundred K entries).
+    if count > (1 << 28) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Array too long",
@@ -419,5 +422,152 @@ mod tests {
         assert_eq!(gguf.data_start, 256); // file pos after tensor infos (228) aligned up to 32
 
         Ok(())
+    }
+
+    // ---- negative-path tests: every rejection branch ----
+
+    /// Write `bytes` to a unique temp file and return Gguf::open's result.
+    fn open_bytes(tag: &str, bytes: &[u8]) -> IoResult<Gguf> {
+        let path =
+            std::env::temp_dir().join(format!("gguf_rs_neg_{}_{}.gguf", tag, std::process::id()));
+        std::fs::write(&path, bytes)?;
+        let r = Gguf::open(&path);
+        let _ = std::fs::remove_file(&path);
+        r
+    }
+
+    fn assert_invalid(tag: &str, bytes: &[u8], msg_contains: &str) {
+        match open_bytes(tag, bytes) {
+            Ok(_) => panic!("{tag}: expected InvalidData, got Ok"),
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidData,
+                    "{tag}: wrong kind: {e}"
+                );
+                assert!(
+                    e.to_string().contains(msg_contains),
+                    "{tag}: message {:?} lacks {:?}",
+                    e.to_string(),
+                    msg_contains
+                );
+            }
+        }
+    }
+
+    /// Minimal valid header: magic, version 3, 0 tensors, 0 metadata.
+    fn header(version: u32, tensors: u64, kvs: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x46554747u32.to_le_bytes());
+        b.extend_from_slice(&version.to_le_bytes());
+        b.extend_from_slice(&tensors.to_le_bytes());
+        b.extend_from_slice(&kvs.to_le_bytes());
+        b
+    }
+
+    fn kv_key(b: &mut Vec<u8>, key: &str) {
+        b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        b.extend_from_slice(key.as_bytes());
+    }
+
+    #[test]
+    fn test_empty_file_is_rejected() {
+        assert!(open_bytes("empty", &[]).is_err());
+    }
+
+    #[test]
+    fn test_bad_magic() {
+        let mut b = header(3, 0, 0);
+        b[0] = b'X';
+        assert_invalid("magic", &b, "magic");
+    }
+
+    #[test]
+    fn test_unsupported_version() {
+        assert_invalid("version", &header(1, 0, 0), "version");
+        assert_invalid("version99", &header(99, 0, 0), "version");
+    }
+
+    #[test]
+    fn test_version_2_accepted() {
+        let g = open_bytes("v2", &header(2, 0, 0)).expect("v2 must parse");
+        assert_eq!(g.version, 2);
+        assert_eq!(g.tensors.len(), 0);
+    }
+
+    #[test]
+    fn test_truncated_metadata() {
+        // declares 1 kv, provides nothing
+        let b = header(3, 0, 1);
+        assert!(open_bytes("trunc_meta", &b).is_err());
+    }
+
+    #[test]
+    fn test_string_too_long() {
+        let mut b = header(3, 0, 1);
+        // key with an absurd declared length
+        b.extend_from_slice(&(u64::MAX).to_le_bytes());
+        assert_invalid("longstr", &b, "String too long");
+    }
+
+    #[test]
+    fn test_invalid_utf8_string() {
+        let mut b = header(3, 0, 1);
+        b.extend_from_slice(&4u64.to_le_bytes());
+        b.extend_from_slice(&[0xff, 0xfe, 0xfd, 0xfc]);
+        assert_invalid("utf8", &b, "UTF-8");
+    }
+
+    #[test]
+    fn test_unknown_metadata_value_type() {
+        let mut b = header(3, 0, 1);
+        kv_key(&mut b, "k");
+        b.extend_from_slice(&99u32.to_le_bytes()); // no such value type
+        assert_invalid("valtype", &b, "value type");
+    }
+
+    #[test]
+    fn test_array_too_long() {
+        let mut b = header(3, 0, 1);
+        kv_key(&mut b, "k");
+        b.extend_from_slice(&9u32.to_le_bytes()); // array
+        b.extend_from_slice(&4u32.to_le_bytes()); // of u32
+        b.extend_from_slice(&(u64::MAX).to_le_bytes()); // absurd count
+        assert_invalid("longarr", &b, "Array too long");
+    }
+
+    #[test]
+    fn test_unknown_tensor_ggml_type() {
+        let mut b = header(3, 1, 0);
+        kv_key(&mut b, "t"); // tensor name reuses string layout
+        b.extend_from_slice(&1u32.to_le_bytes()); // n_dims = 1
+        b.extend_from_slice(&32u64.to_le_bytes()); // dim
+        b.extend_from_slice(&255u32.to_le_bytes()); // no such ggml type
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+        assert_invalid("ggmltype", &b, "type");
+    }
+
+    #[test]
+    fn test_dim_not_multiple_of_block_size() {
+        let mut b = header(3, 1, 0);
+        kv_key(&mut b, "t");
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&100u64.to_le_bytes()); // Q4_K block is 256; 100 not divisible
+        b.extend_from_slice(&12u32.to_le_bytes()); // Q4_K
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let r = open_bytes("blocksize", &b);
+        assert!(
+            r.is_err(),
+            "dims not multiple of block size must be rejected"
+        );
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_truncated_tensor_info() {
+        let mut b = header(3, 1, 0);
+        kv_key(&mut b, "t");
+        b.extend_from_slice(&2u32.to_le_bytes()); // claims 2 dims, provides none
+        assert!(open_bytes("trunc_tensor", &b).is_err());
     }
 }
