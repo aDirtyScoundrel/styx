@@ -62,35 +62,39 @@ pub struct Model {
     pub hp: HParams,
     gpu: Gpu,
     // pipelines
-    mmv1: Pipeline,    // q8_0 matvec NUM_ROWS=1
-    mmv4: Pipeline,    // q8_0 matvec NUM_ROWS=4 (lm_head)
+    mmv1: Pipeline, // q8_0 matvec NUM_ROWS=1
+    mmv4: Pipeline, // q8_0 matvec NUM_ROWS=4 (lm_head)
+    #[allow(dead_code)] // kept: pre-fused-attention path, used by tests/debug
     mmv_f32: Pipeline, // f32 matvec (attention)
-    p_rms: Pipeline,   // rms_norm_f32, do_multiply=true
-    p_add: Pipeline,   // add_f32_f32_f32, norepeat
-    p_cpy: Pipeline,   // cpy_f32_f32 (strided KV writes)
-    p_soft: Pipeline,  // soft_max_f32
-    p_attn: Pipeline,  // fused decode attention (custom)
-    p_glu: Pipeline,   // swiglu_f32 split
-    p_rope: Pipeline,  // rope_neox_f32
+    p_rms: Pipeline, // rms_norm_f32, do_multiply=true
+    p_add: Pipeline, // add_f32_f32_f32, norepeat
+    p_cpy: Pipeline, // cpy_f32_f32 (strided KV writes)
+    #[allow(dead_code)]
+    p_soft: Pipeline, // soft_max_f32
+    p_attn: Pipeline, // fused decode attention (custom)
+    p_glu: Pipeline, // swiglu_f32 split
+    p_rope: Pipeline, // rope_neox_f32
     layers: Vec<Layer>,
     output_norm: Buffer,
     embd_raw: Vec<u8>, // q8_0 token_embd, host-side for row gather
     embd_gpu: GpuMat,  // tied lm_head
     // GPU activations (f32)
-    bx: Buffer,      // hidden state (n_embd)
-    bnorm: Buffer,   // normed hidden (n_embd)
-    bq: Buffer,      // q (q_dim)
-    bk: Buffer,      // k (kv_dim)
-    bv: Buffer,      // v (kv_dim)
-    battn: Buffer,   // attention output (q_dim)
-    bproj: Buffer,   // projection scratch (n_embd)
-    bgate: Buffer,   // ffn gate (n_ff)
-    bup: Buffer,     // ffn up (n_ff)
+    bx: Buffer,    // hidden state (n_embd)
+    bnorm: Buffer, // normed hidden (n_embd)
+    bq: Buffer,    // q (q_dim)
+    bk: Buffer,    // k (kv_dim)
+    bv: Buffer,    // v (kv_dim)
+    battn: Buffer, // attention output (q_dim)
+    bproj: Buffer, // projection scratch (n_embd)
+    bgate: Buffer, // ffn gate (n_ff)
+    bup: Buffer,   // ffn up (n_ff)
+    #[allow(dead_code)]
     bscores: Buffer, // [n_heads][n_ctx_max] raw scores
-    bprobs: Buffer,  // [n_heads][n_ctx_max] softmaxed
+    #[allow(dead_code)]
+    bprobs: Buffer, // [n_heads][n_ctx_max] softmaxed
     blogits: Buffer, // (n_vocab)
-    bpos: Buffer,    // i32[1] current position (rope)
-    bdummy: Buffer,  // dummy for unused bindings
+    bpos: Buffer,  // i32[1] current position (rope)
+    bdummy: Buffer, // dummy for unused bindings
     batch: Option<Batch>,
     pub n_ctx_max: usize,
     n_past: usize,

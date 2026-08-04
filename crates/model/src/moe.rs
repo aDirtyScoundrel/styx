@@ -101,6 +101,7 @@ pub struct MoeModel {
     output_norm: Buffer,
     head: GpuMat,
     embd_raw: Vec<u8>,
+    #[allow(dead_code)]
     embd_type: u32,
     // activations
     bx: Buffer,

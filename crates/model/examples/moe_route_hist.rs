@@ -15,7 +15,7 @@ fn main() {
     let n_layers = m.hp.base.n_layers;
     let n_expert = m.hp.n_expert;
     let mut hist = vec![vec![0u64; n_expert]; n_layers];
-    let mut record = |m: &model::MoeModel, hist: &mut Vec<Vec<u64>>| {
+    let record = |m: &model::MoeModel, hist: &mut Vec<Vec<u64>>| {
         for (l, ids) in m.last_expert_ids().iter().enumerate() {
             for &e in ids {
                 hist[l][e as usize] += 1;
