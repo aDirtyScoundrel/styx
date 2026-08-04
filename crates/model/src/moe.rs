@@ -122,10 +122,17 @@ pub struct MoeModel {
     batch: Option<Batch>,
     pub n_ctx_max: usize,
     n_past: usize,
+    /// Paged KV: tokens currently backed per layer cache. Grows by
+    /// KV_PAGE_TOKENS (device copy-on-grow) up to n_ctx_max.
+    kv_cap: usize,
     /// Bytes of expert weights (gate+up+down) per (layer,expert) slab —
     /// the PCIe cost of one cold expert hit.
     pub slab_bytes: u64,
 }
+
+/// Paged-KV page size in tokens. One page = KV_PAGE_TOKENS*kv_dim*4 bytes
+/// per cache (k and v^T separately) per layer.
+pub const KV_PAGE_TOKENS: usize = 512;
 
 /// Scalar dequant of one q4_K block (ggml layout) — for host embedding rows.
 fn dequant_q4k(block: &[u8], out: &mut [f32]) {
@@ -451,8 +458,10 @@ impl MoeModel {
                 down_exps: upload_exp(&n("ffn_down_exps"), l)?,
                 remap,
                 hot_mask,
-                kcache: gpu.create_buffer((n_ctx_max * kv_dim * 4) as u64, true)?,
-                vtcache: gpu.create_buffer((n_ctx_max * kv_dim * 4) as u64, true)?,
+                // Paged KV: start with one page, grown on demand in
+                // forward_token (copy-on-grow at page boundaries).
+                kcache: gpu.create_buffer((KV_PAGE_TOKENS * kv_dim * 4) as u64, true)?,
+                vtcache: gpu.create_buffer((KV_PAGE_TOKENS * kv_dim * 4) as u64, true)?,
             });
             if l % 8 == 0 {
                 eprintln!("loaded layer {l}/{n_layers}");
@@ -549,6 +558,7 @@ impl MoeModel {
             batch,
             n_ctx_max,
             n_past: 0,
+            kv_cap: KV_PAGE_TOKENS,
             slab_bytes: ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
                 .iter()
                 .map(|s| {
@@ -730,6 +740,28 @@ impl MoeModel {
         assert!(pos < n_ctx, "KV arena full ({n_ctx})");
         let n_t = pos + 1;
         let scale = 1.0 / (hd as f32).sqrt();
+
+        // Paged KV copy-on-grow: when the next write crosses the current
+        // capacity, reallocate every layer's caches one page larger and
+        // migrate contents (host-visible; once per KV_PAGE_TOKENS tokens).
+        if pos >= self.kv_cap {
+            let new_cap = (self.kv_cap + KV_PAGE_TOKENS).min(n_ctx);
+            let old_bytes = self.kv_cap * kv_dim * 4;
+            let mut tmp = vec![0u8; old_bytes];
+            for ly in &mut self.layers {
+                for cache in [&mut ly.kcache, &mut ly.vtcache] {
+                    let new_buf = self
+                        .gpu
+                        .create_buffer((new_cap * kv_dim * 4) as u64, true)
+                        .unwrap();
+                    self.gpu.download(cache, &mut tmp).unwrap();
+                    self.gpu.upload(&new_buf, &tmp).unwrap();
+                    let old = std::mem::replace(cache, new_buf);
+                    self.gpu.destroy_buffer(old);
+                }
+            }
+            self.kv_cap = new_cap;
+        }
 
         // embedding row (q4_K) on host
         let mut x = vec![0f32; n_embd];
