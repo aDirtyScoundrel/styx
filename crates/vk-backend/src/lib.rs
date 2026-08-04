@@ -401,6 +401,11 @@ impl Gpu {
                 .map_err(|e| e.to_string())?;
             self.device.destroy_fence(fence, None);
             self.device.free_command_buffers(self.cmd_pool, &[cb]);
+            // Synchronous dispatch: the set is no longer in use — recycle the
+            // pool so repeated dispatches can't exhaust it.
+            self.device
+                .reset_descriptor_pool(self.dpool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
     }
