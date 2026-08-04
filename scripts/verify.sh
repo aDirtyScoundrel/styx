@@ -47,6 +47,13 @@ if [ ! -f "$MODEL" ]; then
     echo "[4/5][5/5] skip: reference gguf not found: $MODEL"
     echo "  (set MOE_VERIFY_GGUF to run golden-token stages)"
 else
+    echo "[3.5/5] onboarding scanner"
+    ONBOARD=./target/release/examples/onboard
+    "$ONBOARD" "$MODEL" >/dev/null 2>&1 && ok "onboard: reference model READY" \
+        || die "onboard: reference model not READY"
+    "$ONBOARD" /dev/null >/dev/null 2>&1 && die "onboard: accepted non-gguf" \
+        || ok "onboard: rejects non-gguf"
+
     echo "[4/5] golden-token regression (64-tok greedy, 3 placements)"
     run() { env "$@" "$GEN" "$MODEL" 64 $PROMPT 2>/dev/null; }
     GOLD_TOKS=$(cat "$GOLD")
