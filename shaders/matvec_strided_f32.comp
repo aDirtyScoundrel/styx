@@ -1,0 +1,36 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// Strided f32 matvec: d[r] = dot(A[r*stride_a .. +ncols], x[0..ncols])
+// One workgroup per output row. Used for attention scores/values where
+// cache rows are strided (row stride != ncols).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ncols;
+    uint stride_a; // element stride between rows of A
+} p;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) readonly buffer X { float data_x[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+shared float tmp[32];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = row * p.stride_a;
+
+    float sum = 0.0;
+    for (uint c = tid; c < p.ncols; c += 32) {
+        sum += data_a[base + c] * data_x[c];
+    }
+    tmp[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) { tmp[tid] += tmp[tid + s]; }
+        barrier();
+    }
+    if (tid == 0) { data_d[row] = tmp[0]; }
+}

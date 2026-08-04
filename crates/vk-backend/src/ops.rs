@@ -34,6 +34,30 @@ impl BinaryPush {
         }
     }
 
+    /// Copy src (n0, n1) contiguous into dst rows of stride `dst_row_stride`
+    /// (elements), for strided cpy/get_rows-style ops using this head.
+    pub fn strided_rows(n0: u32, n1: u32, dst_row_stride: u32) -> BinaryPush {
+        BinaryPush {
+            ne: n0 * n1,
+            src0: [n0, n1, 1, 1, 1, n0, n0 * n1, n0 * n1],
+            src1: [n0, n1, 1, 1, 1, n0, n0 * n1, n0 * n1],
+            dst: [
+                n0,
+                n1,
+                1,
+                1,
+                1,
+                dst_row_stride,
+                dst_row_stride * n1,
+                dst_row_stride * n1,
+            ],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0,
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
@@ -220,6 +244,87 @@ pub fn fastdiv_magic(d: u32) -> (u32, u32) {
     }
     let mp = ((1u64 << 32) * ((1u64 << l) - d as u64) / d as u64 + 1) as u32;
     (mp, l)
+}
+
+/// generic_unary_head push constants (cpy, scale, ...). L values for the
+/// fastdivs are packed 3-per-u32 as bytes (slot*8, 6 bits).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UnaryPush {
+    pub ne: u32,
+    /// ne00..ne03, nb00..nb03 (element strides)
+    pub src0: [u32; 8],
+    /// ne10..ne13, nb10..nb13
+    pub dst: [u32; 8],
+    /// (aoffset << 16) | doffset, element units, <= 65535 each.
+    pub misalign_offsets: u32,
+    pub param1: f32,
+    pub param2: f32,
+    pub param3: f32,
+    pub param4: f32,
+    pub ne0_012mp: u32,
+    pub ne0_01mp: u32,
+    pub ne0_0mp: u32,
+    pub ne0_ls: u32,
+    pub ne1_012mp: u32,
+    pub ne1_01mp: u32,
+    pub ne1_0mp: u32,
+    pub ne1_ls: u32,
+}
+
+impl UnaryPush {
+    fn pack_fastdiv(ne: [u32; 4]) -> (u32, u32, u32, u32) {
+        let (mp012, l012) = fastdiv_magic(ne[0] * ne[1] * ne[2]);
+        let (mp01, l01) = fastdiv_magic(ne[0] * ne[1]);
+        let (mp0, l0) = fastdiv_magic(ne[0]);
+        (mp012, mp01, mp0, l012 | (l01 << 8) | (l0 << 16))
+    }
+
+    /// Copy `n` contiguous src elements into dst with element stride
+    /// `dst_stride` starting at element `dst_off` (< 65536).
+    pub fn strided_copy(n: u32, dst_stride: u32, dst_off: u32) -> UnaryPush {
+        assert!(dst_off <= 0xFFFF);
+        let src0 = [n, 1, 1, 1, 1, n, n, n];
+        let dst = [
+            n,
+            1,
+            1,
+            1,
+            dst_stride,
+            n * dst_stride,
+            n * dst_stride,
+            n * dst_stride,
+        ];
+        let (a012, a01, a0, als) = Self::pack_fastdiv([n, 1, 1, 1]);
+        let (d012, d01, d0, dls) = Self::pack_fastdiv([n, 1, 1, 1]);
+        UnaryPush {
+            ne: n,
+            src0,
+            dst,
+            misalign_offsets: dst_off,
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            ne0_012mp: a012,
+            ne0_01mp: a01,
+            ne0_0mp: a0,
+            ne0_ls: als,
+            ne1_012mp: d012,
+            ne1_01mp: d01,
+            ne1_0mp: d0,
+            ne1_ls: dls,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const _ as *const u8,
+                std::mem::size_of::<UnaryPush>(),
+            )
+        }
+    }
 }
 
 impl GluPush {

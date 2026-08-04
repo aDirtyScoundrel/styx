@@ -58,6 +58,22 @@ impl Batch {
         push: &[u8],
         groups: (u32, u32, u32),
     ) -> Result<(), String> {
+        let ranges: Vec<(&Buffer, u64, u64)> =
+            buffers.iter().map(|b| (*b, 0, vk::WHOLE_SIZE)).collect();
+        self.dispatch_ranges(gpu, p, &ranges, push, groups)
+    }
+
+    /// Like `dispatch`, but each binding is a (buffer, offset_bytes, range_bytes)
+    /// sub-range (range = vk::WHOLE_SIZE for "rest of buffer"). Offsets must
+    /// respect minStorageBufferOffsetAlignment (64 B on RADV).
+    pub fn dispatch_ranges(
+        &mut self,
+        gpu: &Gpu,
+        p: &Pipeline,
+        buffers: &[(&Buffer, u64, u64)],
+        push: &[u8],
+        groups: (u32, u32, u32),
+    ) -> Result<(), String> {
         assert!(self.recording);
         assert_eq!(buffers.len() as u32, p.n_bindings);
         unsafe {
@@ -73,10 +89,11 @@ impl Batch {
 
             let infos: Vec<_> = buffers
                 .iter()
-                .map(|b| {
+                .map(|(b, off, range)| {
                     [vk::DescriptorBufferInfo::default()
                         .buffer(b.buf)
-                        .range(vk::WHOLE_SIZE)]
+                        .offset(*off)
+                        .range(*range)]
                 })
                 .collect();
             let writes: Vec<_> = infos
