@@ -11,7 +11,7 @@
 // The patched mul_mat_vec_id_* kernels early-out on SKIP, so the hot and
 // cold dispatches write disjoint slots of the same output buffer.
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
-layout(push_constant) uniform parameter { uint n; uint k; } p;
+layout(push_constant) uniform parameter { uint n; uint k; uint renorm; } p;
 layout(binding = 0) readonly buffer L { float logits[]; };
 layout(binding = 1) writeonly buffer W { float weights[]; };
 layout(binding = 2) writeonly buffer I { int ids[]; };
@@ -43,7 +43,7 @@ void main() {
         wsum += w;
     }
     for (uint s = 0; s < p.k; ++s) {
-        weights[s] = picked[s] / wsum;
+        weights[s] = (p.renorm != 0u) ? picked[s] / wsum : picked[s];
         ids[s] = pid[s];
         uint h = remap[uint(pid[s])];
         ids[16 + s] = int(h);

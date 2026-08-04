@@ -59,8 +59,12 @@ struct ExpMat {
 
 struct Layer {
     attn_norm: Buffer,
-    q_norm: Buffer,
-    k_norm: Buffer,
+    q_norm: Option<Buffer>,
+    k_norm: Option<Buffer>,
+    // attn projection biases (qwen2moe): f32 vectors added post-matvec
+    q_bias: Option<Buffer>,
+    k_bias: Option<Buffer>,
+    v_bias: Option<Buffer>,
     ffn_norm: Buffer,
     wq: GpuMat,
     wk: GpuMat,
@@ -70,6 +74,9 @@ struct Layer {
     gate_exps: ExpMat,
     up_exps: ExpMat,
     down_exps: ExpMat,
+    // shared expert branch (qwen2moe): dense mats, always resident in VRAM,
+    // plus the scalar sigmoid gate row (ffn_gate_inp_shexp, n_embd f32).
+    shexp: Option<Shexp>,
     remap: Buffer,          // n_expert u32: expert -> dense hot idx, or SKIP (u32::MAX)
     hot_mask: Vec<bool>,    // host copy: expert -> pinned in VRAM?
     remap_vec: Vec<u32>,    // host copy of remap
@@ -79,6 +86,13 @@ struct Layer {
     vtcache: Buffer,
 }
 
+struct Shexp {
+    gate_inp: Buffer, // f32 n_embd row: scalar gate logit
+    gate: GpuMat,
+    up: GpuMat,
+    down: GpuMat,
+}
+
 pub struct MoeHParams {
     pub base: HParams,
     pub n_expert: usize,
@@ -86,8 +100,61 @@ pub struct MoeHParams {
     pub n_ff_exp: usize,
 }
 
+/// How Q/K are normalized after their projections.
+#[derive(Clone, Copy, PartialEq)]
+pub enum QkNorm {
+    /// RMS per attention head over head_dim (qwen3moe).
+    PerHead,
+    /// One RMS over the whole q/k vector (olmoe).
+    FullVec,
+    /// No qk norm; projections may carry biases instead (qwen2moe).
+    None,
+}
+
+/// Per-architecture wiring resolved from `general.architecture`.
+pub struct ArchCfg {
+    pub name: &'static str,
+    pub qk_norm: QkNorm,
+    /// attn_{q,k,v}.bias tensors present and added after the projections.
+    pub attn_bias: bool,
+    /// Renormalize the top-k softmax weights (norm_topk_prob).
+    pub norm_topk: bool,
+    /// Always-on shared expert branch (ffn_*_shexp + sigmoid gate).
+    pub shexp: bool,
+}
+
+impl ArchCfg {
+    fn resolve(arch: &str) -> Result<ArchCfg, String> {
+        Ok(match arch {
+            "qwen3moe" => ArchCfg {
+                name: "qwen3moe",
+                qk_norm: QkNorm::PerHead,
+                attn_bias: false,
+                norm_topk: true,
+                shexp: false,
+            },
+            "olmoe" => ArchCfg {
+                name: "olmoe",
+                qk_norm: QkNorm::FullVec,
+                attn_bias: false,
+                norm_topk: false,
+                shexp: false,
+            },
+            "qwen2moe" => ArchCfg {
+                name: "qwen2moe",
+                qk_norm: QkNorm::None,
+                attn_bias: true,
+                norm_topk: false,
+                shexp: true,
+            },
+            other => return Err(format!("unsupported architecture '{other}'")),
+        })
+    }
+}
+
 pub struct MoeModel {
     pub hp: MoeHParams,
+    cfg: ArchCfg,
     gpu: Gpu,
     // quant matvec pipelines keyed by (ggml_type, num_rows)
     mmv: HashMap<(u32, u32), Pipeline>,
@@ -191,15 +258,34 @@ impl MoeModel {
                 other => panic!("missing/unexpected {k}: {other:?}"),
             }
         };
-        let pfx = "qwen3moe";
+        let arch = match g.metadata.get("general.architecture") {
+            Some(gguf_rs::Value::String(s)) => s.clone(),
+            other => return Err(format!("missing general.architecture: {other:?}")),
+        };
+        let cfg = ArchCfg::resolve(&arch)?;
+        let pfx = cfg.name;
         let n_layers = get_u32(&format!("{pfx}.block_count")) as usize;
         let n_embd = get_u32(&format!("{pfx}.embedding_length")) as usize;
         let n_heads = get_u32(&format!("{pfx}.attention.head_count")) as usize;
         let n_kv_heads = get_u32(&format!("{pfx}.attention.head_count_kv")) as usize;
-        let head_dim = get_u32(&format!("{pfx}.attention.key_length")) as usize;
+        // key_length is absent when head_dim == n_embd / n_heads (olmoe, qwen2moe)
+        let head_dim = match g.metadata.get(&format!("{pfx}.attention.key_length")) {
+            Some(gguf_rs::Value::U32(v)) => *v as usize,
+            _ => n_embd / n_heads,
+        };
         let n_expert = get_u32(&format!("{pfx}.expert_count")) as usize;
         let n_expert_used = get_u32(&format!("{pfx}.expert_used_count")) as usize;
-        let n_ff_exp = get_u32(&format!("{pfx}.expert_feed_forward_length")) as usize;
+        // olmoe/qwen2moe: no expert_feed_forward_length key; expert FF width
+        // comes from the tensor shape (ffn_gate_exps dims = [n_embd, n_ff, n_e]).
+        let n_ff_exp = match g.metadata.get(&format!("{pfx}.expert_feed_forward_length")) {
+            Some(gguf_rs::Value::U32(v)) => *v as usize,
+            _ => g
+                .tensors
+                .iter()
+                .find(|t| t.name == "blk.0.ffn_gate_exps.weight")
+                .map(|t| t.dims[1] as usize)
+                .ok_or("no expert_feed_forward_length key and no ffn_gate_exps tensor")?,
+        };
         let rms_eps = get_f32(&format!("{pfx}.attention.layer_norm_rms_epsilon"));
         let rope_base = get_f32(&format!("{pfx}.rope.freq_base"));
         assert!(n_expert_used <= 16, "topk shader caps k at 16");
@@ -458,10 +544,45 @@ impl MoeModel {
             let hot_mask: Vec<bool> = remap_vec.iter().map(|&r| r != u32::MAX).collect();
             let slot_experts: Vec<u32> =
                 hot_order.as_ref().map(|o| o[l].clone()).unwrap_or_default();
+            let opt_f32 = |s: &str| -> Result<Option<Buffer>, String> {
+                let name = format!("blk.{l}.{s}");
+                if tmap.contains_key(&name) {
+                    let t = &tmap[&name];
+                    assert_eq!(t.ggml_type, 0, "{name} not f32");
+                    let b = gpu.create_buffer(t.size_bytes, true)?;
+                    gpu.upload(&b, bytes(&name))?;
+                    Ok(Some(b))
+                } else {
+                    Ok(None)
+                }
+            };
+            let q_norm = opt_f32("attn_q_norm.weight")?;
+            let k_norm = opt_f32("attn_k_norm.weight")?;
+            match cfg.qk_norm {
+                QkNorm::None => assert!(q_norm.is_none(), "unexpected attn_q_norm"),
+                _ => assert!(q_norm.is_some() && k_norm.is_some(), "missing qk norm"),
+            }
+            let q_bias = opt_f32("attn_q.bias")?;
+            let k_bias = opt_f32("attn_k.bias")?;
+            let v_bias = opt_f32("attn_v.bias")?;
+            assert_eq!(cfg.attn_bias, q_bias.is_some(), "attn bias mismatch");
+            let shexp = if cfg.shexp {
+                Some(Shexp {
+                    gate_inp: upload_f32(&n("ffn_gate_inp_shexp"))?,
+                    gate: upload_mat(&n("ffn_gate_shexp"))?,
+                    up: upload_mat(&n("ffn_up_shexp"))?,
+                    down: upload_mat(&n("ffn_down_shexp"))?,
+                })
+            } else {
+                None
+            };
             layers.push(Layer {
                 attn_norm: upload_f32(&n("attn_norm"))?,
-                q_norm: upload_f32(&n("attn_q_norm"))?,
-                k_norm: upload_f32(&n("attn_k_norm"))?,
+                q_norm,
+                k_norm,
+                q_bias,
+                k_bias,
+                v_bias,
                 ffn_norm: upload_f32(&n("ffn_norm"))?,
                 wq: upload_mat(&n("attn_q"))?,
                 wk: upload_mat(&n("attn_k"))?,
@@ -471,6 +592,7 @@ impl MoeModel {
                 gate_exps: upload_exp(&n("ffn_gate_exps"), l)?,
                 up_exps: upload_exp(&n("ffn_up_exps"), l)?,
                 down_exps: upload_exp(&n("ffn_down_exps"), l)?,
+                shexp,
                 remap,
                 hot_mask,
                 remap_vec,
@@ -498,7 +620,10 @@ impl MoeModel {
         let output_norm = upload_f32("output_norm.weight")?;
         let embd_raw = bytes("token_embd.weight").to_vec();
         let embd_type = tmap["token_embd.weight"].ggml_type;
-        assert_eq!(embd_type, 12, "expected q4_K token_embd");
+        assert!(
+            matches!(embd_type, 0 | 1 | 8 | 12),
+            "token_embd ggml_type {embd_type} not host-dequantable (f32/f16/q8_0/q4_K)"
+        );
 
         let q_dim = n_heads * head_dim;
         let k = n_expert_used;
