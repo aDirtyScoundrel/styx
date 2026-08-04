@@ -16,6 +16,15 @@ pub struct Buffer {
     pub mem: vk::DeviceMemory,
     pub size: u64,
     host_visible: bool,
+    /// Sparse-bound buffer: `mem` = hot pool (ReBAR VRAM), plus a cold pool
+    /// (GTT). Per-block placement decided at creation.
+    sparse: Option<SparseInfo>,
+}
+
+struct SparseInfo {
+    mem_cold: vk::DeviceMemory,
+    block_size: u64,
+    blocks_hot: Vec<bool>,
 }
 
 pub struct Pipeline {
@@ -243,7 +252,15 @@ impl Gpu {
             let qfams = instance.get_physical_device_queue_family_properties(pdev);
             let qfam = qfams
                 .iter()
-                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                .position(|q| {
+                    q.queue_flags
+                        .contains(vk::QueueFlags::COMPUTE | vk::QueueFlags::SPARSE_BINDING)
+                })
+                .or_else(|| {
+                    qfams
+                        .iter()
+                        .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                })
                 .ok_or("no compute queue")? as u32;
 
             let prio = [1.0f32];
@@ -260,7 +277,10 @@ impl Gpu {
             let mut f11 = vk::PhysicalDeviceVulkan11Features::default()
                 .storage_buffer16_bit_access(true)
                 .uniform_and_storage_buffer16_bit_access(true);
-            let features = vk::PhysicalDeviceFeatures::default().shader_int16(true);
+            let features = vk::PhysicalDeviceFeatures::default()
+                .shader_int16(true)
+                .sparse_binding(true)
+                .sparse_residency_buffer(true);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qci)
                 .enabled_features(&features)
@@ -379,6 +399,7 @@ impl Gpu {
                 mem,
                 size,
                 host_visible,
+                sparse: None,
             })
         }
     }
@@ -422,13 +443,197 @@ impl Gpu {
                 mem,
                 size,
                 host_visible: true,
+                sparse: None,
             })
         }
+    }
+
+    /// Sparse buffer with per-block placement: blocks where `hot[i]` is true
+    /// are bound to ReBAR VRAM (DEVICE_LOCAL|HOST_VISIBLE), the rest to GTT
+    /// (HOST_VISIBLE only). Block granularity = the buffer's sparse alignment
+    /// (64 KiB on RADV). `hot` is per-alignment-block over the buffer size.
+    pub fn create_buffer_sparse(&self, size: u64, hot: &[bool]) -> Result<Buffer, String> {
+        unsafe {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST;
+            let buf = self
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        .usage(usage)
+                        .flags(
+                            vk::BufferCreateFlags::SPARSE_BINDING
+                                | vk::BufferCreateFlags::SPARSE_RESIDENCY,
+                        ),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let block = req.alignment; // sparse block size
+            let n_blocks = req.size.div_ceil(block) as usize;
+            // Caller sizes its mask from `size` and an assumed 64 KiB block;
+            // req.size is aligned up, so pad (cold) or merge as needed.
+            let hot: Vec<bool> = if hot.len() == n_blocks {
+                hot.to_vec()
+            } else if block == 65536 && hot.len() <= n_blocks {
+                let mut v = hot.to_vec();
+                v.resize(n_blocks, false);
+                v
+            } else {
+                // Different granularity: remap caller's 64 KiB mask onto real blocks.
+                let scale = (block / 65536).max(1) as usize;
+                (0..n_blocks)
+                    .map(|i| {
+                        hot.iter()
+                            .skip(i * scale)
+                            .take(scale)
+                            .any(|&h| h)
+                    })
+                    .collect()
+            };
+            let hot = &hot[..];
+            let n_hot = hot.iter().filter(|&&h| h).count() as u64;
+            let n_cold = n_blocks as u64 - n_hot;
+
+            let alloc = |n: u64, props: vk::MemoryPropertyFlags| -> Result<vk::DeviceMemory, String> {
+                let mt = self
+                    .find_mem_type(req.memory_type_bits, props)
+                    .ok_or("no matching memory type for sparse pool")?;
+                self.device
+                    .allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size((n.max(1)) * block)
+                            .memory_type_index(mt),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+            };
+            // Hot: ReBAR (fall back to device-local-only would break upload; require mappable).
+            let mem_hot = alloc(
+                n_hot,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+                    | vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let mem_cold = {
+                let mt = self
+                    .find_mem_type_not(
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )
+                    .ok_or("no GTT memory type for sparse cold pool")?;
+                self.device
+                    .allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(n_cold.max(1) * block)
+                            .memory_type_index(mt),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?
+            };
+
+            // One SparseBufferMemoryBind per block, packed sequentially into its pool.
+            let mut binds = Vec::with_capacity(n_blocks);
+            let (mut off_hot, mut off_cold) = (0u64, 0u64);
+            for (i, &h) in hot.iter().enumerate() {
+                let sz = block.min(req.size - i as u64 * block);
+                let (mem, off) = if h {
+                    let o = off_hot;
+                    off_hot += block;
+                    (mem_hot, o)
+                } else {
+                    let o = off_cold;
+                    off_cold += block;
+                    (mem_cold, o)
+                };
+                binds.push(
+                    vk::SparseMemoryBind::default()
+                        .resource_offset(i as u64 * block)
+                        .size(sz)
+                        .memory(mem)
+                        .memory_offset(off),
+                );
+            }
+            let buf_binds = [vk::SparseBufferMemoryBindInfo::default()
+                .buffer(buf)
+                .binds(&binds)];
+            let bind_info = vk::BindSparseInfo::default().buffer_binds(&buf_binds);
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| e.to_string())?;
+            self.device
+                .queue_bind_sparse(self.queue, &[bind_info], fence)
+                .map_err(|e| e.to_string())?;
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| e.to_string())?;
+            self.device.destroy_fence(fence, None);
+
+            Ok(Buffer {
+                buf,
+                mem: mem_hot,
+                size,
+                host_visible: true,
+                sparse: Some(SparseInfo {
+                    mem_cold,
+                    block_size: block,
+                    blocks_hot: hot.to_vec(),
+                }),
+            })
+        }
+    }
+
+    /// Upload into a sparse buffer: walk blocks, copy each slice into its
+    /// pool at the packed offset. Both pools are host-visible.
+    fn upload_sparse(&self, b: &Buffer, sp: &SparseInfo, data: &[u8]) -> Result<(), String> {
+        unsafe {
+            let block = sp.block_size as usize;
+            let map = |mem: vk::DeviceMemory, sz: u64| -> Result<*mut u8, String> {
+                Ok(self
+                    .device
+                    .map_memory(mem, 0, sz, vk::MemoryMapFlags::empty())
+                    .map_err(|e| e.to_string())? as *mut u8)
+            };
+            let n_hot = sp.blocks_hot.iter().filter(|&&h| h).count();
+            let n_cold = sp.blocks_hot.len() - n_hot;
+            let p_hot = map(b.mem, (n_hot.max(1) * block) as u64)?;
+            let p_cold = map(sp.mem_cold, (n_cold.max(1) * block) as u64)?;
+            let (mut off_hot, mut off_cold) = (0usize, 0usize);
+            for (i, &h) in sp.blocks_hot.iter().enumerate() {
+                let lo = i * block;
+                if lo >= data.len() {
+                    if h { off_hot += block } else { off_cold += block }
+                    continue;
+                }
+                let hi = (lo + block).min(data.len());
+                let dst = if h {
+                    let p = p_hot.add(off_hot);
+                    off_hot += block;
+                    p
+                } else {
+                    let p = p_cold.add(off_cold);
+                    off_cold += block;
+                    p
+                };
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(lo), dst, hi - lo);
+            }
+            self.device.unmap_memory(b.mem);
+            self.device.unmap_memory(sp.mem_cold);
+        }
+        Ok(())
     }
 
     pub fn upload(&self, b: &Buffer, data: &[u8]) -> Result<(), String> {
         assert!(b.host_visible, "upload targets host-visible buffers");
         assert!(data.len() as u64 <= b.size);
+        if let Some(sp) = &b.sparse {
+            return self.upload_sparse(b, sp, data);
+        }
         unsafe {
             let ptr = self
                 .device
@@ -654,6 +859,9 @@ impl Gpu {
         unsafe {
             self.device.destroy_buffer(b.buf, None);
             self.device.free_memory(b.mem, None);
+            if let Some(sp) = b.sparse {
+                self.device.free_memory(sp.mem_cold, None);
+            }
         }
     }
 
