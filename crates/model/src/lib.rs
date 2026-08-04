@@ -58,9 +58,12 @@ pub struct Model {
     sx: Buffer, // input vector (max n_ff)
     sy: Buffer, // output vector (max n_vocab)
     sf: Buffer, // dummy fuse
-    // KV cache: [layer][t] -> (k, v) flattened kv_dim
+    // KV reserve arena: preallocated at load for n_ctx_max tokens.
+    // [layer] -> flat [t * kv_dim ..] storage; n_past counts filled tokens.
     kcache: Vec<Vec<f32>>,
     vcache: Vec<Vec<f32>>,
+    pub n_ctx_max: usize,
+    n_past: usize,
 }
 
 fn dequant_q8_0_row(raw: &[u8], row: usize, ncols: usize, out: &mut [f32]) {
@@ -200,6 +203,8 @@ impl Model {
         let sf = gpu.create_buffer(4, true)?;
 
         let n_layers = hp.n_layers;
+        let n_ctx_max = 4096usize;
+        let kv_dim = hp.n_kv_heads * hp.head_dim;
         Ok(Model {
             hp,
             gpu,
@@ -212,8 +217,10 @@ impl Model {
             sx,
             sy,
             sf,
-            kcache: vec![Vec::new(); n_layers],
-            vcache: vec![Vec::new(); n_layers],
+            kcache: vec![vec![0f32; n_ctx_max * kv_dim]; n_layers],
+            vcache: vec![vec![0f32; n_ctx_max * kv_dim]; n_layers],
+            n_ctx_max,
+            n_past: 0,
         })
     }
 
@@ -251,12 +258,7 @@ impl Model {
     }
 
     pub fn reset(&mut self) {
-        for k in &mut self.kcache {
-            k.clear();
-        }
-        for v in &mut self.vcache {
-            v.clear();
-        }
+        self.n_past = 0;
     }
 
     /// Feed one token at position = current cache length. Returns logits.
@@ -266,7 +268,8 @@ impl Model {
         let kv_dim = n_kv * hd;
         let q_dim = n_heads * hd;
         let gqa = n_heads / n_kv;
-        let pos = self.kcache[0].len() / kv_dim;
+        let pos = self.n_past;
+        assert!(pos < self.n_ctx_max, "KV arena full ({})", self.n_ctx_max);
 
         let mut x = vec![0f32; n_embd];
         dequant_q8_0_row(&self.embd_raw, token as usize, n_embd, &mut x);
@@ -323,8 +326,8 @@ impl Model {
             if dbg && l == 0 {
                 eprintln!("Qcur_normed+rope-0 sum = {:.6}", sum(&q));
             }
-            self.kcache[l].extend_from_slice(&k);
-            self.vcache[l].extend_from_slice(&v);
+            self.kcache[l][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
+            self.vcache[l][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&v);
             let n_t = pos + 1;
             let scale = 1.0 / (hd as f32).sqrt();
             for h in 0..n_heads {
@@ -369,6 +372,7 @@ impl Model {
         }
 
         rms_norm(&x.clone(), &self.output_norm, self.hp.rms_eps, &mut x);
+        self.n_past += 1;
         let mut logits = vec![0f32; self.hp.n_vocab];
         self.matvec(&self.embd_gpu, &x, &mut logits);
         if dbg {
