@@ -485,31 +485,27 @@ impl Gpu {
                 // Different granularity: remap caller's 64 KiB mask onto real blocks.
                 let scale = (block / 65536).max(1) as usize;
                 (0..n_blocks)
-                    .map(|i| {
-                        hot.iter()
-                            .skip(i * scale)
-                            .take(scale)
-                            .any(|&h| h)
-                    })
+                    .map(|i| hot.iter().skip(i * scale).take(scale).any(|&h| h))
                     .collect()
             };
             let hot = &hot[..];
             let n_hot = hot.iter().filter(|&&h| h).count() as u64;
             let n_cold = n_blocks as u64 - n_hot;
 
-            let alloc = |n: u64, props: vk::MemoryPropertyFlags| -> Result<vk::DeviceMemory, String> {
-                let mt = self
-                    .find_mem_type(req.memory_type_bits, props)
-                    .ok_or("no matching memory type for sparse pool")?;
-                self.device
-                    .allocate_memory(
-                        &vk::MemoryAllocateInfo::default()
-                            .allocation_size((n.max(1)) * block)
-                            .memory_type_index(mt),
-                        None,
-                    )
-                    .map_err(|e| e.to_string())
-            };
+            let alloc =
+                |n: u64, props: vk::MemoryPropertyFlags| -> Result<vk::DeviceMemory, String> {
+                    let mt = self
+                        .find_mem_type(req.memory_type_bits, props)
+                        .ok_or("no matching memory type for sparse pool")?;
+                    self.device
+                        .allocate_memory(
+                            &vk::MemoryAllocateInfo::default()
+                                .allocation_size((n.max(1)) * block)
+                                .memory_type_index(mt),
+                            None,
+                        )
+                        .map_err(|e| e.to_string())
+                };
             // Hot: ReBAR (fall back to device-local-only would break upload; require mappable).
             let mem_hot = alloc(
                 n_hot,
@@ -607,7 +603,11 @@ impl Gpu {
             for (i, &h) in sp.blocks_hot.iter().enumerate() {
                 let lo = i * block;
                 if lo >= data.len() {
-                    if h { off_hot += block } else { off_cold += block }
+                    if h {
+                        off_hot += block
+                    } else {
+                        off_cold += block
+                    }
                     continue;
                 }
                 let hi = (lo + block).min(data.len());

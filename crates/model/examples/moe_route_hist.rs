@@ -4,7 +4,9 @@
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: moe_route_hist <gguf> <n> <tok...>");
+    let path = args
+        .next()
+        .expect("usage: moe_route_hist <gguf> <n> <tok...>");
     let n_predict: usize = args.next().unwrap().parse().unwrap();
     let prompt: Vec<u32> = args.map(|a| a.parse().unwrap()).collect();
     assert!(!prompt.is_empty());

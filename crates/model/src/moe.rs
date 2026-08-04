@@ -51,6 +51,9 @@ struct ExpMat {
     nrows: usize, // per expert
     ncols: usize,
     ggml_type: u32,
+    // Dense hot buffer: hottest experts' slabs copied contiguously into VRAM
+    // (plus one trailing zero slab), ids remapped by the router shader.
+    hot: Option<Buffer>,
 }
 
 struct Layer {
@@ -66,6 +69,7 @@ struct Layer {
     gate_exps: ExpMat,
     up_exps: ExpMat,
     down_exps: ExpMat,
+    remap: Buffer, // n_expert u32: expert -> dense hot idx, or SKIP (u32::MAX)
     kcache: Buffer,
     vtcache: Buffer,
 }
@@ -271,13 +275,17 @@ impl MoeModel {
             std::mem::size_of::<RopePush>() as u32,
             &[],
         )?;
-        let p_topk = gpu.create_pipeline(&ours("topk_softmax_f32"), 3, 8, &[])?;
+        let p_topk = gpu.create_pipeline(&ours("topk_softmax_f32"), 4, 8, &[])?;
         let p_reduce = gpu.create_pipeline(&ours("moe_reduce_f32"), 3, 8, &[])?;
 
         // Expert placement policy:
         //   default              -> all experts in GTT (host visible, PCIe reads)
         //   MOE_EXPERTS_VRAM=1   -> all experts in VRAM
         //   MOE_EXPERTS_VRAM_MB=N -> first N MiB of expert tensors in VRAM, rest GTT
+        //   + MOE_EXPERT_HIST=csv -> popularity pinning: hottest (layer,expert)
+        //     slabs are COPIED into per-layer dense VRAM buffers (hot buffer),
+        //     router ids remapped in-shader; cold experts stay in the GTT
+        //     buffer. Budget = MOE_EXPERTS_VRAM_MB. (Sparse binding lost 2x.)
         let all_vram = std::env::var("MOE_EXPERTS_VRAM").is_ok();
         let vram_budget: u64 = if all_vram {
             u64::MAX
@@ -295,45 +303,42 @@ impl MoeModel {
         // Globally rank (layer,expert) by hits, pin hottest experts' slabs
         // (gate+up+down) into ReBAR VRAM until the MB budget is used, rest GTT.
         // Requires MOE_EXPERTS_VRAM_MB (budget) alongside.
-        let hot_sets: Option<Vec<std::collections::HashSet<u32>>> = std::env::var(
-            "MOE_EXPERT_HIST",
-        )
-        .ok()
-        .map(|p| {
-            let txt = std::fs::read_to_string(&p).expect("read MOE_EXPERT_HIST");
-            let mut entries: Vec<(u64, usize, u32)> = txt
-                .lines()
-                .skip(1)
-                .filter_map(|l| {
-                    let mut it = l.split(',');
-                    let layer: usize = it.next()?.parse().ok()?;
-                    let expert: u32 = it.next()?.parse().ok()?;
-                    let hits: u64 = it.next()?.parse().ok()?;
-                    Some((hits, layer, expert))
-                })
-                .collect();
-            entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            // Per-expert byte cost across gate+up+down for one layer.
-            let cost: u64 = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
-                .iter()
-                .map(|s| {
-                    let t = &tmap[&format!("blk.0.{s}.weight")];
-                    t.size_bytes / n_expert as u64
-                })
-                .sum();
-            let mut sets = vec![std::collections::HashSet::new(); n_layers];
-            let mut left = vram_budget;
-            for (_hits, l, e) in entries {
-                if left < cost {
-                    break;
+        let hot_sets: Option<Vec<std::collections::HashSet<u32>>> =
+            std::env::var("MOE_EXPERT_HIST").ok().map(|p| {
+                let txt = std::fs::read_to_string(&p).expect("read MOE_EXPERT_HIST");
+                let mut entries: Vec<(u64, usize, u32)> = txt
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| {
+                        let mut it = l.split(',');
+                        let layer: usize = it.next()?.parse().ok()?;
+                        let expert: u32 = it.next()?.parse().ok()?;
+                        let hits: u64 = it.next()?.parse().ok()?;
+                        Some((hits, layer, expert))
+                    })
+                    .collect();
+                entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                // Per-expert byte cost across gate+up+down for one layer.
+                let cost: u64 = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .iter()
+                    .map(|s| {
+                        let t = &tmap[&format!("blk.0.{s}.weight")];
+                        t.size_bytes / n_expert as u64
+                    })
+                    .sum();
+                let mut sets = vec![std::collections::HashSet::new(); n_layers];
+                let mut left = vram_budget;
+                for (_hits, l, e) in entries {
+                    if left < cost {
+                        break;
+                    }
+                    left -= cost;
+                    sets[l].insert(e);
                 }
-                left -= cost;
-                sets[l].insert(e);
-            }
-            let pinned: usize = sets.iter().map(|s| s.len()).sum();
-            eprintln!("popularity pinning: {pinned} (layer,expert) slabs hot");
-            sets
-        });
+                let pinned: usize = sets.iter().map(|s| s.len()).sum();
+                eprintln!("popularity pinning: {pinned} (layer,expert) slabs hot");
+                sets
+            });
 
         let upload_mat = |name: &str| -> Result<GpuMat, String> {
             let t = &tmap[name];
@@ -346,37 +351,51 @@ impl MoeModel {
                 ggml_type: t.ggml_type,
             })
         };
+        // hot_order[layer] = sorted hot expert ids; dense hot index = position.
+        let hot_order: Option<Vec<Vec<u32>>> = hot_sets.as_ref().map(|sets| {
+            sets.iter()
+                .map(|s| {
+                    let mut v: Vec<u32> = s.iter().copied().collect();
+                    v.sort_unstable();
+                    v
+                })
+                .collect()
+        });
         let upload_exp = |name: &str, layer: usize| -> Result<ExpMat, String> {
             let t = &tmap[name];
-            let b = if let Some(sets) = &hot_sets {
-                // Sparse: pin hot experts' contiguous slabs to VRAM blocks.
-                let slab = t.size_bytes / n_expert as u64;
-                let block = 65536u64; // RADV sparse block; asserted inside
-                let n_blocks = t.size_bytes.div_ceil(block) as usize;
-                let mut hot = vec![false; n_blocks];
-                for &e in &sets[layer] {
-                    let lo = (e as u64 * slab / block) as usize;
-                    let hi = (((e as u64 + 1) * slab).div_ceil(block) as usize).min(n_blocks);
-                    for h in &mut hot[lo..hi] {
-                        *h = true;
+            let (buf, hot) = if let Some(order) = &hot_order {
+                // Dense reorder: copy hot slabs contiguously into a VRAM
+                // buffer; the full tensor stays in GTT for the cold path.
+                let slab = (t.size_bytes / n_expert as u64) as usize;
+                let src = bytes(name);
+                let ord = &order[layer];
+                let hot_buf = if ord.is_empty() {
+                    None
+                } else {
+                    let mut hb = Vec::with_capacity(ord.len() * slab);
+                    for &e in ord {
+                        hb.extend_from_slice(&src[e as usize * slab..(e as usize + 1) * slab]);
                     }
-                }
-                let n_hot = hot.iter().filter(|&&h| h).count() as u64;
-                vram_used.set(vram_used.get() + n_hot * block);
-                gpu.create_buffer_sparse(t.size_bytes, &hot)?
+                    let b = gpu.create_buffer(hb.len() as u64, true)?;
+                    gpu.upload(&b, &hb)?;
+                    vram_used.set(vram_used.get() + hb.len() as u64);
+                    Some(b)
+                };
+                (gpu.create_buffer_host(t.size_bytes)?, hot_buf)
             } else if vram_left.get() >= t.size_bytes {
                 vram_left.set(vram_left.get() - t.size_bytes);
                 vram_used.set(vram_used.get() + t.size_bytes);
-                gpu.create_buffer(t.size_bytes, true)?
+                (gpu.create_buffer(t.size_bytes, true)?, None)
             } else {
-                gpu.create_buffer_host(t.size_bytes)?
+                (gpu.create_buffer_host(t.size_bytes)?, None)
             };
-            gpu.upload(&b, bytes(name))?;
+            gpu.upload(&buf, bytes(name))?;
             Ok(ExpMat {
-                buf: b,
+                buf,
                 ncols: t.dims[0] as usize,
                 nrows: t.dims[1] as usize,
                 ggml_type: t.ggml_type,
+                hot,
             })
         };
         let upload_f32_mat = |name: &str| -> Result<GpuMat, String> {
@@ -403,6 +422,15 @@ impl MoeModel {
         let mut layers = Vec::new();
         for l in 0..n_layers {
             let n = |s: &str| format!("blk.{l}.{s}.weight");
+            // remap[e] = dense hot index or SKIP (0xFFFFFFFF)
+            let mut remap_vec = vec![u32::MAX; n_expert];
+            if let Some(order) = &hot_order {
+                for (i, &e) in order[l].iter().enumerate() {
+                    remap_vec[e as usize] = i as u32;
+                }
+            }
+            let remap = gpu.create_buffer((n_expert * 4) as u64, true)?;
+            gpu.upload(&remap, as_bytes(&remap_vec))?;
             layers.push(Layer {
                 attn_norm: upload_f32(&n("attn_norm"))?,
                 q_norm: upload_f32(&n("attn_q_norm"))?,
@@ -416,6 +444,7 @@ impl MoeModel {
                 gate_exps: upload_exp(&n("ffn_gate_exps"), l)?,
                 up_exps: upload_exp(&n("ffn_up_exps"), l)?,
                 down_exps: upload_exp(&n("ffn_down_exps"), l)?,
+                remap,
                 kcache: gpu.create_buffer((n_ctx_max * kv_dim * 4) as u64, true)?,
                 vtcache: gpu.create_buffer((n_ctx_max * kv_dim * 4) as u64, true)?,
             });
@@ -427,7 +456,11 @@ impl MoeModel {
         eprintln!(
             "expert placement: {:.2} GiB in VRAM, budget {}",
             vram_used.get() as f64 / (1 << 30) as f64,
-            if vram_budget == u64::MAX { "ALL".into() } else { format!("{} MiB", vram_budget >> 20) }
+            if vram_budget == u64::MAX {
+                "ALL".into()
+            } else {
+                format!("{} MiB", vram_budget >> 20)
+            }
         );
         let output_norm = upload_f32("output_norm.weight")?;
         let embd_raw = bytes("token_embd.weight").to_vec();
@@ -446,7 +479,8 @@ impl MoeModel {
         let bproj = mk(n_embd)?;
         let brouter = mk(n_expert)?;
         let bweights = mk(k)?;
-        let bids = mk(n_layers * 16)?; // 64B-aligned row per layer
+        // 3 rows x 64B per layer: [orig ids | hot ids | cold ids]
+        let bids = mk(n_layers * 48)?;
         let bgate = mk(k * n_ff_exp)?;
         let bup = mk(k * n_ff_exp)?;
         let bdown = mk(k * n_embd)?;
@@ -547,16 +581,20 @@ impl MoeModel {
     }
 
     /// Expert matvec: for each of the k selected experts (ids buffer),
-    /// y[slot] = W[expert] * x[slot % ne11].
-    fn rec_matvec_id(
+    /// y[slot] = W[expert] * x[slot % ne11]. `wbuf` is the weight buffer to
+    /// read (full GTT tensor or dense hot VRAM buffer); `ids_off` selects
+    /// which id row drives the dispatch (slots with SKIP ids early-out).
+    #[allow(clippy::too_many_arguments)]
+    fn rec_matvec_id_buf(
         &self,
         batch: &mut Batch,
         w: &ExpMat,
+        wbuf: &Buffer,
         x: &Buffer,
         y: &Buffer,
         ne11: u32,
         barrier: bool,
-        layer: usize,
+        ids_off: u64,
     ) {
         let k = self.hp.n_expert_used as u32;
         let pipe = &self.mmv_id[&w.ggml_type];
@@ -579,18 +617,41 @@ impl MoeModel {
                 &self.gpu,
                 pipe,
                 &[
-                    (&w.buf, 0, WHOLE),
+                    (wbuf, 0, WHOLE),
                     (x, 0, WHOLE),
                     (y, 0, WHOLE),
                     (&self.bdummy, 0, WHOLE),
                     (&self.bdummy, 0, WHOLE),
-                    (&self.bids, (layer * 64) as u64, WHOLE),
+                    (&self.bids, ids_off, WHOLE),
                 ],
                 push.as_bytes(),
                 (w.nrows as u32, k, 1),
                 barrier,
             )
             .unwrap();
+    }
+
+    /// Expert matvec with hot/cold split: when the layer has a dense hot
+    /// buffer, dispatch twice (hot ids into the VRAM copy, cold ids into
+    /// the GTT tensor) — disjoint slots, so no barrier between the pair.
+    fn rec_matvec_id(
+        &self,
+        batch: &mut Batch,
+        w: &ExpMat,
+        x: &Buffer,
+        y: &Buffer,
+        ne11: u32,
+        barrier: bool,
+        layer: usize,
+    ) {
+        let base = (layer * 192) as u64;
+        match &w.hot {
+            Some(hot) => {
+                self.rec_matvec_id_buf(batch, w, hot, x, y, ne11, false, base + 64);
+                self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base + 128);
+            }
+            None => self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base),
+        }
     }
 
     fn rec_rms(
@@ -769,7 +830,7 @@ impl MoeModel {
                     (ly.router.nrows as u32, 1, 1),
                 )
                 .unwrap();
-            // top-k softmax with renorm
+            // top-k softmax with renorm + hot/cold id split via remap table
             batch
                 .dispatch_ranges(
                     &self.gpu,
@@ -777,7 +838,8 @@ impl MoeModel {
                     &[
                         (&self.brouter, 0, WHOLE),
                         (&self.bweights, 0, WHOLE),
-                        (&self.bids, (l * 64) as u64, WHOLE),
+                        (&self.bids, (l * 192) as u64, WHOLE),
+                        (&ly.remap, 0, WHOLE),
                     ],
                     as_bytes(&[hp.n_expert as u32, k as u32]),
                     (1, 1, 1),
@@ -861,13 +923,13 @@ impl MoeModel {
     pub fn last_expert_ids(&self) -> Vec<Vec<u32>> {
         let n_layers = self.hp.base.n_layers;
         let k = self.hp.n_expert_used;
-        let mut raw = vec![0u8; n_layers * 64];
+        let mut raw = vec![0u8; n_layers * 192];
         self.gpu.download(&self.bids, &mut raw).unwrap();
         (0..n_layers)
             .map(|l| {
                 (0..k)
                     .map(|i| {
-                        let o = l * 64 + i * 4;
+                        let o = l * 192 + i * 4;
                         u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
                     })
                     .collect()

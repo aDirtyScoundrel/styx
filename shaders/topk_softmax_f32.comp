@@ -1,11 +1,23 @@
 #version 450
 // Softmax over n logits, then top-k selection with renormalized weights
 // (Qwen3-MoE router: norm_topk_prob=true). Single workgroup; n <= 512.
+//
+// Writes THREE id rows (each up to 16 i32s) in the ids buffer:
+//   ids[0..k]        original expert ids (probe/debug, last_expert_ids)
+//   ids[16..16+k]    hot ids: index into the dense VRAM hot buffer, or
+//                    SKIP (0xFFFFFFFF) when the expert is cold
+//   ids[32..32+k]    cold ids: original id when cold, SKIP when hot
+// remap[e] = dense hot index for expert e, or SKIP when not pinned.
+// The patched mul_mat_vec_id_* kernels early-out on SKIP, so the hot and
+// cold dispatches write disjoint slots of the same output buffer.
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform parameter { uint n; uint k; } p;
 layout(binding = 0) readonly buffer L { float logits[]; };
 layout(binding = 1) writeonly buffer W { float weights[]; };
 layout(binding = 2) writeonly buffer I { int ids[]; };
+layout(binding = 3) readonly buffer R { uint remap[]; };
+
+const uint SKIP = 0xFFFFFFFFu;
 
 void main() {
     // serial: n=128 -> negligible vs the expert matvecs this gates
@@ -33,5 +45,8 @@ void main() {
     for (uint s = 0; s < p.k; ++s) {
         weights[s] = picked[s] / wsum;
         ids[s] = pid[s];
+        uint h = remap[uint(pid[s])];
+        ids[16 + s] = int(h);
+        ids[32 + s] = (h == SKIP) ? pid[s] : int(SKIP);
     }
 }
