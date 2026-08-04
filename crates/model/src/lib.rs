@@ -52,7 +52,7 @@ struct Layer {
     w_up: GpuMat,
     w_down: GpuMat,
     kcache: Buffer,  // [n_ctx_max][kv_dim] f32
-    vtcache: Buffer, // [kv_dim][n_ctx_max] f32 (transposed)
+    vtcache: Buffer, // [n_ctx_max][kv_dim] f32 (row-major, same layout as kcache)
 }
 
 pub struct Model {
@@ -66,6 +66,7 @@ pub struct Model {
     p_add: Pipeline,   // add_f32_f32_f32, norepeat
     p_cpy: Pipeline,   // cpy_f32_f32 (strided KV writes)
     p_soft: Pipeline,  // soft_max_f32
+    p_attn: Pipeline,  // fused decode attention (custom)
     p_glu: Pipeline,   // swiglu_f32 split
     p_rope: Pipeline,  // rope_neox_f32
     layers: Vec<Layer>,
@@ -106,6 +107,19 @@ fn dequant_q8_0_row(raw: &[u8], row: usize, ncols: usize, out: &mut [f32]) {
 
 fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn as_bytes_of<T>(v: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+}
+
+#[repr(C)]
+struct AttnPush {
+    n_t: u32,
+    hd: u32,
+    kv_dim: u32,
+    gqa: u32,
+    scale: f32,
 }
 
 const WHOLE: u64 = u64::MAX; // vk::WHOLE_SIZE
@@ -206,6 +220,12 @@ impl Model {
             std::mem::size_of::<SoftMaxPush>() as u32,
             &[(0, 128)],
         )?;
+        let attn_spv: PathBuf = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../shaders/attn_decode_f32.spv"
+        )
+        .into();
+        let p_attn = gpu.create_pipeline(&attn_spv, 4, 20, &[])?;
         let p_glu = gpu.create_pipeline(
             &spv("swiglu_f32"),
             3,
@@ -292,6 +312,7 @@ impl Model {
             p_add,
             p_cpy,
             p_soft,
+            p_attn,
             p_glu,
             p_rope,
             layers,
@@ -503,78 +524,43 @@ impl Model {
                     ((kv_dim as u32).div_ceil(512), 1, 1),
                 )
                 .unwrap();
-            // scatter v into transposed vtcache: element i -> i*n_ctx + pos
-            let cpv = UnaryPush::strided_copy(kv_dim as u32, n_ctx as u32, pos as u32);
+            // copy v row into vtcache (row-major, like kcache)
+            let cpv = UnaryPush::contig_copy(kv_dim as u32);
             batch
                 .dispatch_ranges(
                     &self.gpu,
                     &self.p_cpy,
-                    &[(&self.bv, 0, WHOLE), (&ly.vtcache, 0, WHOLE)],
+                    &[
+                        (&self.bv, 0, WHOLE),
+                        (&ly.vtcache, (pos * kv_dim * 4) as u64, WHOLE),
+                    ],
                     cpv.as_bytes(),
                     ((kv_dim as u32).div_ceil(512), 1, 1),
                 )
                 .unwrap();
-            // --- per-head attention ---
-            for h in 0..n_heads {
-                let kvh = h / gqa;
-                // scores[t] = K[t,kvh,:] · q[h,:]
-                let sp: [u32; 2] = [hd as u32, kv_dim as u32];
-                batch
-                    .dispatch_ranges(
-                        &self.gpu,
-                        &self.mmv_f32,
-                        &[
-                            (&ly.kcache, (kvh * hd * 4) as u64, WHOLE),
-                            (&self.bq, (h * hd * 4) as u64, WHOLE),
-                            (&self.bscores, (h * n_ctx * 4) as u64, WHOLE),
-                        ],
-                        as_bytes(&sp),
-                        (n_t as u32, 1, 1),
-                    )
-                    .unwrap();
-                // softmax over n_t with scale
-                let sm = SoftMaxPush::rows(n_t as u32, 1, scale);
-                batch
-                    .dispatch_ranges(
-                        &self.gpu,
-                        &self.p_soft,
-                        &[
-                            (&self.bscores, (h * n_ctx * 4) as u64, WHOLE),
-                            (&self.bdummy, 0, WHOLE),
-                            (&self.bdummy, 0, WHOLE),
-                            (&self.bprobs, (h * n_ctx * 4) as u64, WHOLE),
-                        ],
-                        sm.as_bytes(),
-                        (1, 1, 1),
-                    )
-                    .unwrap();
-                // out[i] = Vt[kvh*hd + i, 0..n_t] · probs
-                let vp: [u32; 2] = [n_t as u32, n_ctx as u32];
-                batch
-                    .dispatch_ranges(
-                        &self.gpu,
-                        &self.mmv_f32,
-                        &[
-                            (&ly.vtcache, (kvh * hd * n_ctx * 4) as u64, WHOLE),
-                            (&self.bprobs, (h * n_ctx * 4) as u64, WHOLE),
-                            (&self.battn, (h * hd * 4) as u64, WHOLE),
-                        ],
-                        as_bytes(&vp),
-                        (hd as u32, 1, 1),
-                    )
-                    .unwrap();
-            }
+            // --- fused decode attention: one dispatch, one workgroup per head ---
+            let ap = AttnPush {
+                n_t: n_t as u32,
+                hd: hd as u32,
+                kv_dim: kv_dim as u32,
+                gqa: gqa as u32,
+                scale,
+            };
+            batch
+                .dispatch_ranges(
+                    &self.gpu,
+                    &self.p_attn,
+                    &[
+                        (&self.bq, 0, WHOLE),
+                        (&ly.kcache, 0, WHOLE),
+                        (&ly.vtcache, 0, WHOLE),
+                        (&self.battn, 0, WHOLE),
+                    ],
+                    as_bytes_of(&ap),
+                    (n_heads as u32, 1, 1),
+                )
+                .unwrap();
             self.rec_matvec(&mut batch, &ly.wo, &self.battn, &self.bproj);
-            if l == 0 {
-                probe!(&self.bscores, 1, "score[0,0]");
-                probe!(&self.bprobs, 1, "prob[0,0]");
-                probe!(&self.battn, hd, "attn head0");
-                probe!(&self.bv, hd, "v head0");
-                probe!(&ly.vtcache, 1, "vt[0,0]");
-                probe!(&self.bv, 1, "v[0]");
-                probe!(&ly.kcache, 1, "kcache[0]");
-                probe!(&self.bk, 1, "k[0]");
-            }
             if l == 0 {
                 probe!(&self.battn, n_heads * hd, "attn_out-0");
                 probe!(&self.bproj, n_embd, "attn_proj-0");

@@ -280,6 +280,11 @@ impl UnaryPush {
         (mp012, mp01, mp0, l012 | (l01 << 8) | (l0 << 16))
     }
 
+    /// Copy `n` contiguous elements (dst offset applied via descriptor range).
+    pub fn contig_copy(n: u32) -> UnaryPush {
+        Self::strided_copy(n, 1, 0)
+    }
+
     /// Copy `n` contiguous src elements into dst with element stride
     /// `dst_stride` starting at element `dst_off` (< 65536).
     pub fn strided_copy(n: u32, dst_stride: u32, dst_off: u32) -> UnaryPush {

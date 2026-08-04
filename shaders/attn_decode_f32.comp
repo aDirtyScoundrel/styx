@@ -1,0 +1,80 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// Fused single-token decode attention (GQA), f32.
+// One workgroup per query head. For head h:
+//   scores[t] = scale * dot(q[h], K[t, h/gqa])   t in [0, n_t)
+//   probs = softmax(scores)
+//   out[h] = sum_t probs[t] * V[t, h/gqa]
+// K and V caches are row-major [t][kv_dim] (V is NOT transposed here).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_t;     // tokens in cache (incl. current)
+    uint hd;      // head dim
+    uint kv_dim;  // n_kv_heads * hd (cache row stride, elements)
+    uint gqa;     // query heads per kv head
+    float scale;  // 1/sqrt(hd)
+} p;
+
+layout(binding = 0) readonly buffer Q { float data_q[]; };  // [n_heads*hd]
+layout(binding = 1) readonly buffer K { float data_k[]; };  // [n_ctx][kv_dim]
+layout(binding = 2) readonly buffer V { float data_v[]; };  // [n_ctx][kv_dim]
+layout(binding = 3) writeonly buffer O { float data_o[]; }; // [n_heads*hd]
+
+shared float sh_q[256];      // head_dim <= 256
+shared float sh_red[128];
+shared float sh_prob;        // broadcast prob of current tile token
+shared float sh_m, sh_l;
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kvh = h / p.gqa;
+    const uint qbase = h * p.hd;
+    const uint kvoff = kvh * p.hd;
+
+    // load q into shared
+    for (uint i = tid; i < p.hd; i += 128) { sh_q[i] = data_q[qbase + i]; }
+    barrier();
+
+    // online softmax accumulation. Each thread owns acc for elements i = tid, tid+128, ...
+    float acc0 = 0.0, acc1 = 0.0; // supports hd <= 256
+    float m = -1.0 / 0.0;
+    float l = 0.0;
+
+    for (uint t = 0; t < p.n_t; ++t) {
+        const uint krow = t * p.kv_dim + kvoff;
+        // dot(q, k_t) via workgroup reduction
+        float part = 0.0;
+        for (uint i = tid; i < p.hd; i += 128) { part += sh_q[i] * data_k[krow + i]; }
+        sh_red[tid] = part;
+        barrier();
+        [[unroll]] for (uint s = 64; s > 0; s >>= 1) {
+            if (tid < s) { sh_red[tid] += sh_red[tid + s]; }
+            barrier();
+        }
+        if (tid == 0) {
+            float sc = sh_red[0] * p.scale;
+            float m_new = max(m, sc);
+            float corr = exp(m - m_new);
+            float pr = exp(sc - m_new);
+            sh_l = l * corr + pr;
+            sh_m = m_new;
+            sh_prob = pr;
+            sh_red[1] = corr;
+        }
+        barrier();
+        const float pr = sh_prob;
+        const float corr = sh_red[1];
+        m = sh_m; l = sh_l;
+        const uint vrow = t * p.kv_dim + kvoff;
+        // accumulate v with rescale
+        if (tid < p.hd)        { acc0 = acc0 * corr + pr * data_v[vrow + tid]; }
+        if (tid + 128 < p.hd)  { acc1 = acc1 * corr + pr * data_v[vrow + tid + 128]; }
+        barrier();
+    }
+
+    const float inv_l = 1.0 / l;
+    if (tid < p.hd)       { data_o[qbase + tid] = acc0 * inv_l; }
+    if (tid + 128 < p.hd) { data_o[qbase + tid + 128] = acc1 * inv_l; }
+}

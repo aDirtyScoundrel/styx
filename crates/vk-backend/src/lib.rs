@@ -313,14 +313,26 @@ impl Gpu {
                 )
                 .map_err(|e| e.to_string())?;
             let req = self.device.get_buffer_memory_requirements(buf);
-            let want = if host_visible {
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+            // Prefer ReBAR (DEVICE_LOCAL + HOST_VISIBLE): mappable AND full
+            // VRAM bandwidth. Plain HOST_VISIBLE lands in GTT (PCIe-limited).
+            let mt = if host_visible {
+                self.find_mem_type(
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .or_else(|| {
+                    self.find_mem_type(
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                })
             } else {
-                vk::MemoryPropertyFlags::DEVICE_LOCAL
-            };
-            let mt = self
-                .find_mem_type(req.memory_type_bits, want)
-                .ok_or("no matching memory type")?;
+                self.find_mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            }
+            .ok_or("no matching memory type")?;
             let mem = self
                 .device
                 .allocate_memory(
