@@ -1,0 +1,12 @@
+[package]
+name = "gtt-gather-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = "0.38"
+
+[profile.release]
+opt-level = 3
+
+[workspace]

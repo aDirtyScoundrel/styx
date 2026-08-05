@@ -1,0 +1,38 @@
+#version 450
+// M7b kill probe: compute-shader gather from GTT (host-visible) to VRAM.
+// One contiguous 16B-vector copy per thread; dispatch covers `n_slabs`
+// expert-sized slabs. MODE: 0 = contiguous gather (read src, write dst),
+// 1 = strided 144B-block reads (matvec access pattern) writing nothing
+// but a checksum (isolates the read path), 2 = pure GTT writes (constant
+// source), 3 = contiguous read-only (no dst write, checksum sink).
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint slab_vecs;   // uvec4 count per slab
+    uint n_slabs;     // slabs covered by this dispatch
+    uint mode;
+    uint _pad;
+} p;
+layout(set = 0, binding = 0) readonly buffer Src { uvec4 src[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { uvec4 dst[]; };
+layout(set = 0, binding = 2) buffer Sink { uint sink; };
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint total = p.slab_vecs * p.n_slabs;
+    if (g >= total) return;
+    if (p.mode == 0u) {
+        dst[g] = src[g];
+    } else if (p.mode == 1u) {
+        // strided read: each thread touches a different 36-uvec (144B) block
+        // region, like mul_mat_vec_id stepping through quant blocks
+        uint blk = g / 9u;          // 144B = 9 uvec4
+        uint inblk = g % 9u;
+        uvec4 v = src[blk * 9u + inblk];
+        if (v.x == 0xDEADBEEFu) sink = g;
+    } else if (p.mode == 2u) {
+        dst[g] = uvec4(1u, 2u, 3u, 4u);
+    } else {
+        uvec4 v = src[g];
+        if (v.x == 0xDEADBEEFu) sink = g;
+    }
+}
