@@ -665,6 +665,7 @@ impl MoeModel {
                 n_expert_used,
                 n_ff_exp,
             },
+            cfg,
             gpu,
             mmv,
             mmv_id,
@@ -1018,22 +1019,45 @@ impl MoeModel {
             self.rec_matvec_b(&mut batch, &ly.wq, &self.bnorm, &self.bq, false);
             self.rec_matvec_b(&mut batch, &ly.wk, &self.bnorm, &self.bk, false);
             self.rec_matvec_b(&mut batch, &ly.wv, &self.bnorm, &self.bv, true);
-            self.rec_rms(
-                &mut batch,
-                &self.bq,
-                &ly.q_norm,
-                &self.bq,
-                hd as u32,
-                n_heads as u32,
-            );
-            self.rec_rms(
-                &mut batch,
-                &self.bk,
-                &ly.k_norm,
-                &self.bk,
-                hd as u32,
-                n_kv as u32,
-            );
+            match self.cfg.qk_norm {
+                QkNorm::PerHead => {
+                    self.rec_rms(
+                        &mut batch,
+                        &self.bq,
+                        ly.q_norm.as_ref().unwrap(),
+                        &self.bq,
+                        hd as u32,
+                        n_heads as u32,
+                    );
+                    self.rec_rms(
+                        &mut batch,
+                        &self.bk,
+                        ly.k_norm.as_ref().unwrap(),
+                        &self.bk,
+                        hd as u32,
+                        n_kv as u32,
+                    );
+                }
+                QkNorm::FullVec => {
+                    self.rec_rms(
+                        &mut batch,
+                        &self.bq,
+                        ly.q_norm.as_ref().unwrap(),
+                        &self.bq,
+                        (n_heads * hd) as u32,
+                        1,
+                    );
+                    self.rec_rms(
+                        &mut batch,
+                        &self.bk,
+                        ly.k_norm.as_ref().unwrap(),
+                        &self.bk,
+                        kv_dim as u32,
+                        1,
+                    );
+                }
+                QkNorm::None => {}
+            }
             for (buf, nh) in [(&self.bq, n_heads), (&self.bk, n_kv)] {
                 let push = RopePush::neox(hd as u32, nh as u32, 1, self.hp.base.rope_base);
                 batch
