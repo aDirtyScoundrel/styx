@@ -2,11 +2,13 @@
 // Softmax over n logits, then top-k selection with renormalized weights
 // (Qwen3-MoE router: norm_topk_prob=true). Single workgroup; n <= 512.
 //
-// Writes THREE id rows (each up to 16 i32s) in the ids buffer:
+// Writes FOUR id rows (each up to 16 i32s) in the ids buffer:
 //   ids[0..k]        original expert ids (probe/debug, last_expert_ids)
 //   ids[16..16+k]    hot ids: index into the dense VRAM hot buffer, or
 //                    SKIP (0xFFFFFFFF) when the expert is cold
 //   ids[32..32+k]    cold ids: original id when cold, SKIP when hot
+//   ids[48..48+k]    slot ids: slot index s when cold, SKIP when hot
+//                    (drives the M7b-A arena matvec: slot == arena expert)
 // remap[e] = dense hot index for expert e, or SKIP when not pinned.
 // The patched mul_mat_vec_id_* kernels early-out on SKIP, so the hot and
 // cold dispatches write disjoint slots of the same output buffer.
@@ -48,5 +50,6 @@ void main() {
         uint h = remap[uint(pid[s])];
         ids[16 + s] = int(h);
         ids[32 + s] = (h == SKIP) ? pid[s] : int(SKIP);
+        ids[48 + s] = (h == SKIP) ? int(s) : int(SKIP);
     }
 }

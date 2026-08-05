@@ -22,6 +22,9 @@ fn main() {
     }
     println!("\n=== TENSOR NAMES (all {}) ===", g.tensors.len());
     for t in &g.tensors {
-        println!("{} dims{:?} type{} size{}", t.name, t.dims, t.ggml_type, t.size_bytes);
+        println!(
+            "{} dims{:?} type{} size{}",
+            t.name, t.dims, t.ggml_type, t.size_bytes
+        );
     }
 }

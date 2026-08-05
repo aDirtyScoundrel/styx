@@ -1,0 +1,53 @@
+#version 450
+// M7b-A: gather cold expert slabs from GTT into three VRAM scratch arenas.
+//
+// Dispatch: (k, 1, 1) — one workgroup per cold slot s. Slot s reads the
+// cold id row (bound at the layer's row-3 offset); SKIP means the expert
+// is hot and this slot's arena region is left stale (the cold matvec
+// early-outs on SKIP for the same slot, so stale bytes are never read).
+//
+// Arena layout (three buffers, one per FFN tensor): arena_gate holds k
+// contiguous gate slabs, slot s at s*vg uvec4s; likewise up/down. Slot
+// order == cold id slot order, so the cold matvec_id dispatch binds the
+// matching arena as its A buffer and drives it with the SLOT id row
+// (ids[48..]): slot index == arena expert id, no remap needed.
+//
+// Measured on NAVI31: coalesced GTT->VRAM gather = 25-28 GB/s
+// (probes/gtt-gather-probe) vs ~5.8 GiB/s for in-place matvec reads.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    uint vg;        // gate slab uvec4 count
+    uint vu;        // up slab uvec4 count
+    uint vd;        // down slab uvec4 count
+    uint base_g;    // gate tensor base in gate[], uvec4s
+    uint base_up;   // up tensor base in up[], uvec4s
+    uint base_d;    // down tensor base in down[], uvec4s
+    uint _pad;
+} p;
+layout(binding = 0) readonly buffer Gate { uvec4 gate[]; };
+layout(binding = 1) readonly buffer Up { uvec4 up[]; };
+layout(binding = 2) readonly buffer Down { uvec4 down[]; };
+layout(binding = 3) buffer ArenaG { uvec4 arena_g[]; };
+layout(binding = 4) buffer ArenaU { uvec4 arena_u[]; };
+layout(binding = 5) buffer ArenaD { uvec4 arena_d[]; };
+layout(binding = 6) readonly buffer Ids { int ids[]; };
+
+const uint SKIP = 0xFFFFFFFFu;
+
+void main() {
+    uint s = gl_WorkGroupID.x;
+    uint e = uint(ids[s]);
+    if (e == SKIP) return;
+    uint gsrc = p.base_g + e * p.vg;
+    uint gdst = s * p.vg;
+    for (uint i = gl_LocalInvocationID.x; i < p.vg; i += 256u)
+        arena_g[gdst + i] = gate[gsrc + i];
+    uint usrc = p.base_up + e * p.vu;
+    uint udst = s * p.vu;
+    for (uint i = gl_LocalInvocationID.x; i < p.vu; i += 256u)
+        arena_u[udst + i] = up[usrc + i];
+    uint dsrc = p.base_d + e * p.vd;
+    uint ddst = s * p.vd;
+    for (uint i = gl_LocalInvocationID.x; i < p.vd; i += 256u)
+        arena_d[ddst + i] = down[dsrc + i];
+}

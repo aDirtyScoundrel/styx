@@ -57,7 +57,7 @@ else
     echo "[4/5] golden-token regression (64-tok greedy, 3 placements)"
     run() { env "$@" "$GEN" "$MODEL" 64 $PROMPT 2>/dev/null; }
     GOLD_TOKS=$(cat "$GOLD")
-    for place in "GTT-only:" \
+    for place in "GTT-only:MOE_EXPERTS_VRAM_MB=0" \
                  "hot/cold-6GiB:MOE_EXPERT_HIST=$HIST MOE_EXPERTS_VRAM_MB=6144" \
                  "all-VRAM:MOE_EXPERTS_VRAM=1"; do
         name=${place%%:*}; envs=${place#*:}

@@ -132,7 +132,9 @@ fn main() {
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(sm)
             .name(main_name);
-        let cpci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pl);
+        let cpci = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(pl);
         let pipelines = [cpci];
         let pipe = device
             .create_compute_pipelines(vk::PipelineCache::null(), &pipelines, None)
@@ -149,19 +151,20 @@ fn main() {
         let big = 64 * MB;
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
 
-        let make_buffer = |size: u64, want: vk::MemoryPropertyFlags, avoid: vk::MemoryPropertyFlags| {
-            let bci = vk::BufferCreateInfo::default().size(size).usage(usage);
-            let buf = device.create_buffer(&bci, None).unwrap();
-            let req = device.get_buffer_memory_requirements(buf);
-            let mt = find_mem_type(&mem_props, req.memory_type_bits, want, avoid)
-                .expect("memory type");
-            let mai = vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mt);
-            let mem = device.allocate_memory(&mai, None).unwrap();
-            device.bind_buffer_memory(buf, mem, 0).unwrap();
-            buf
-        };
+        let make_buffer =
+            |size: u64, want: vk::MemoryPropertyFlags, avoid: vk::MemoryPropertyFlags| {
+                let bci = vk::BufferCreateInfo::default().size(size).usage(usage);
+                let buf = device.create_buffer(&bci, None).unwrap();
+                let req = device.get_buffer_memory_requirements(buf);
+                let mt = find_mem_type(&mem_props, req.memory_type_bits, want, avoid)
+                    .expect("memory type");
+                let mai = vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(mt);
+                let mem = device.allocate_memory(&mai, None).unwrap();
+                device.bind_buffer_memory(buf, mem, 0).unwrap();
+                buf
+            };
 
         // GTT source (write-combine, the type expert tensors use)
         let gbuf = make_buffer(
@@ -237,14 +240,7 @@ fn main() {
             device.begin_command_buffer(cb, &begin_info).unwrap();
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipe);
             let sets = [alloc];
-            device.cmd_bind_descriptor_sets(
-                cb,
-                vk::PipelineBindPoint::COMPUTE,
-                pl,
-                0,
-                &sets,
-                &[],
-            );
+            device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, pl, 0, &sets, &[]);
             device.cmd_push_constants(cb, pl, vk::ShaderStageFlags::COMPUTE, 0, push.as_bytes());
             device.cmd_dispatch(cb, (total_threads as u32).div_ceil(256), 1, 1);
             device.end_command_buffer(cb).unwrap();

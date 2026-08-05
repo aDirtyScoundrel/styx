@@ -2,8 +2,8 @@
 //! get_rows_q8_0, add, swiglu, soft_max, rope_neox, mul_mat_vec_q8_0.
 //! Gated behind MOE_GPU_TESTS=1.
 
-use vk_backend::ops::*;
 use vk_backend::Gpu;
+use vk_backend::ops::*;
 
 const SPV_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

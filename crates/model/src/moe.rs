@@ -12,7 +12,7 @@
 //! VRAM. The GPU reads experts over PCIe on demand — only ~3B of the 30B
 //! parameters are touched per token, so the working set is small.
 
-use crate::{as_bytes, as_bytes_of, AttnPush, HParams, WHOLE};
+use crate::{AttnPush, HParams, WHOLE, as_bytes, as_bytes_of};
 use gguf_rs::Gguf;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -168,6 +168,7 @@ pub struct MoeModel {
     p_rope: Pipeline,
     p_topk: Pipeline,
     p_reduce: Pipeline,
+    p_gather: Pipeline,
     layers: Vec<Layer>,
     output_norm: Buffer,
     head: GpuMat,
@@ -191,6 +192,13 @@ pub struct MoeModel {
     blogits: Buffer,
     bpos: Buffer,
     bdummy: Buffer,
+    /// M7b-A scratch arenas: k contiguous slabs each, DEVICE_LOCAL VRAM.
+    /// Cold experts are gathered here from GTT each layer before the cold
+    /// matvec reads them (25-28 GB/s gather vs ~5.8 GiB/s in-place reads).
+    /// None when no expert tensor lives in GTT (all-VRAM placement).
+    barena_g: Option<Buffer>,
+    barena_u: Option<Buffer>,
+    barena_d: Option<Buffer>,
     batch: Option<Batch>,
     pub n_ctx_max: usize,
     n_past: usize,
@@ -203,6 +211,12 @@ pub struct MoeModel {
     /// Online repinning: every N tokens swap the coldest resident experts
     /// for the hottest non-resident ones (MOE_REPIN_INTERVAL; 0/unset off).
     repin_interval: usize,
+    /// M7b-A arena path (MOE_ARENA=1 force on, =0 force off, default auto:
+    /// on only when no layer has a hot buffer — pure-GTT placement. With
+    /// hot/cold pinning the arena's post-gather barrier serializes the
+    /// PCIe gather that would otherwise overlap hot compute, so the
+    /// in-place cold path is faster there; overlap needs M7b-B).
+    arena_enabled: bool,
     /// Max slab swaps per layer per repin event (MOE_REPIN_MAX, default 2).
     repin_max: usize,
     /// Total expert slabs swapped in by repinning so far.
@@ -384,29 +398,84 @@ impl MoeModel {
             std::mem::size_of::<RopePush>() as u32,
             &[],
         )?;
-        let p_topk = gpu.create_pipeline(&ours("topk_softmax_f32"), 4, 8, &[])?;
+        let p_topk = gpu.create_pipeline(&ours("topk_softmax_f32"), 4, 12, &[])?;
         let p_reduce = gpu.create_pipeline(&ours("moe_reduce_f32"), 3, 8, &[])?;
+        let p_gather = gpu.create_pipeline(&ours("gather_slabs_f32"), 7, 28, &[])?;
 
         // Expert placement policy:
-        //   default              -> all experts in GTT (host visible, PCIe reads)
-        //   MOE_EXPERTS_VRAM=1   -> all experts in VRAM
-        //   MOE_EXPERTS_VRAM_MB=N -> first N MiB of expert tensors in VRAM, rest GTT
+        //   default              -> AUTO budget: greedily fill device VRAM
+        //                           (heap - headroom - pinned - KV - arena)
+        //   MOE_EXPERTS_VRAM_MB=N -> explicit budget in MiB (override auto)
+        //   MOE_EXPERTS_VRAM=1   -> all experts in VRAM (errors if too big)
         //   + MOE_EXPERT_HIST=csv -> popularity pinning: hottest (layer,expert)
         //     slabs are COPIED into per-layer dense VRAM buffers (hot buffer),
         //     router ids remapped in-shader; cold experts stay in the GTT
-        //     buffer. Budget = MOE_EXPERTS_VRAM_MB. (Sparse binding lost 2x.)
+        //     buffer. Budget = MOE_EXPERTS_VRAM_MB or auto. (Sparse lost 2x.)
+        //   MOE_HEADROOM_MB=N    -> VRAM left for GUI/other apps (default 1024)
         let all_vram = std::env::var("MOE_EXPERTS_VRAM").is_ok();
+        // Max context for KV reservation accounting (matches the load-time
+        // arena below; both must stay in sync).
+        let n_ctx_max = 4096usize;
+        let explicit_mb: Option<u64> = std::env::var("MOE_EXPERTS_VRAM_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        // Reservations for the auto budget (bytes):
+        //   pinned tier = every non-_exps. tensor (norms, attn, router, head)
+        let pinned_bytes: u64 = g
+            .tensors
+            .iter()
+            .filter(|t| !t.name.contains("_exps."))
+            .map(|t| t.size_bytes)
+            .sum();
+        //   KV at full context: 2 caches x n_layers x n_ctx x kv_dim f32
+        let kv_max_bytes = (n_layers * 2 * n_ctx_max * n_kv_heads * head_dim * 4) as u64;
+        //   M7b-A arena: k x max slab over layers (allocated iff any expert
+        //   spills to GTT; reserved here because auto usually spills).
+        let max_slab_sum: u64 = (0..n_layers)
+            .map(|l| {
+                ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .iter()
+                    .map(|s| {
+                        let t = &tmap[&format!("blk.{l}.{s}.weight")];
+                        t.size_bytes / n_expert as u64
+                    })
+                    .sum::<u64>()
+            })
+            .max()
+            .unwrap_or(0);
+        let arena_bytes = n_expert_used as u64 * max_slab_sum;
+        let headroom_mb: u64 = std::env::var("MOE_HEADROOM_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let device_vram = gpu.vram_bytes();
+        let auto_budget = device_vram
+            .saturating_sub(headroom_mb * 1024 * 1024 + pinned_bytes + kv_max_bytes + arena_bytes);
         let vram_budget: u64 = if all_vram {
             u64::MAX
+        } else if let Some(mb) = explicit_mb {
+            mb * 1024 * 1024
         } else {
-            std::env::var("MOE_EXPERTS_VRAM_MB")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|mb| mb * 1024 * 1024)
-                .unwrap_or(0)
+            auto_budget
         };
+        if explicit_mb.is_none() && !all_vram {
+            eprintln!(
+                "auto expert budget: {} MiB (device VRAM {:.1} GiB - {} MiB headroom \
+                 - {:.2} GiB pinned - {:.2} GiB KV - {:.0} MiB arena)",
+                auto_budget >> 20,
+                device_vram as f64 / (1 << 30) as f64,
+                headroom_mb,
+                pinned_bytes as f64 / (1 << 30) as f64,
+                kv_max_bytes as f64 / (1 << 30) as f64,
+                arena_bytes as f64 / (1 << 20) as f64,
+            );
+        }
         let vram_left = std::cell::Cell::new(vram_budget);
         let vram_used = std::cell::Cell::new(0u64);
+        // Set true when any expert tensor lands in GTT (host memory) —
+        // then the M7b-A gather arena is allocated and the cold matvec
+        // reads from VRAM scratch instead of PCIe.
+        let experts_in_gtt = std::cell::Cell::new(false);
 
         // Popularity pinning: MOE_EXPERT_HIST=<csv "layer,expert,hits">.
         // Globally rank (layer,expert) by hits, pin hottest experts' slabs
@@ -490,13 +559,17 @@ impl MoeModel {
                     vram_used.set(vram_used.get() + hb.len() as u64);
                     Some(b)
                 };
-                (gpu.create_buffer_host(t.size_bytes)?, hot_buf)
+                let hb = (gpu.create_buffer_host(t.size_bytes)?, hot_buf);
+                experts_in_gtt.set(true);
+                hb
             } else if vram_left.get() >= t.size_bytes {
                 vram_left.set(vram_left.get() - t.size_bytes);
                 vram_used.set(vram_used.get() + t.size_bytes);
                 (gpu.create_buffer(t.size_bytes, true)?, None)
             } else {
-                (gpu.create_buffer_host(t.size_bytes)?, None)
+                let hb = (gpu.create_buffer_host(t.size_bytes)?, None);
+                experts_in_gtt.set(true);
+                hb
             };
             gpu.upload(&buf, bytes(name))?;
             Ok(ExpMat {
@@ -527,7 +600,6 @@ impl MoeModel {
             Ok(b)
         };
 
-        let n_ctx_max = 4096usize;
         let kv_dim = n_kv_heads * head_dim;
         let mut layers = Vec::new();
         for l in 0..n_layers {
@@ -637,14 +709,53 @@ impl MoeModel {
         let bproj = mk(n_embd)?;
         let brouter = mk(n_expert)?;
         let bweights = mk(k)?;
-        // 3 rows x 64B per layer: [orig ids | hot ids | cold ids]
-        let bids = mk(n_layers * 48)?;
+        // 4 rows x 64B per layer: [orig ids | hot ids | cold ids | slot ids]
+        let bids = mk(n_layers * 64)?;
         let bgate = mk(k * n_ff_exp)?;
         let bup = mk(k * n_ff_exp)?;
         let bdown = mk(k * n_embd)?;
         let blogits = mk(n_vocab)?;
         let bpos = mk(1)?;
         let bdummy = mk(1)?;
+
+        // M7b-A scratch arenas (only when experts live in GTT): k slabs
+        // each, device-local VRAM, reused every layer. Mixed-quant models
+        // can vary slab size per layer, so size from the MAX slab across
+        // all layers — the gather strides by the actual per-layer size.
+        let (barena_g, barena_u, barena_d) = if experts_in_gtt.get() {
+            let max_slab = |prefix: &str| -> u64 {
+                (0..n_layers)
+                    .map(|l| {
+                        let t = &tmap[&format!("blk.{l}.{prefix}_exps.weight")];
+                        t.size_bytes / n_expert as u64
+                    })
+                    .max()
+                    .unwrap()
+            };
+            let ab = |prefix: &str| -> Result<Buffer, String> {
+                let slab = max_slab(prefix);
+                assert!(slab % 16 == 0, "{prefix}_exps slab not 16B-aligned");
+                let bytes = k as u64 * slab;
+                vram_used.set(vram_used.get() + bytes);
+                gpu.create_buffer(bytes, false)
+            };
+            (
+                Some(ab("ffn_gate")?),
+                Some(ab("ffn_up")?),
+                Some(ab("ffn_down")?),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        // Auto arena: on only for pure-GTT placement (no hot buffers).
+        // With hot/cold pinning the gather barrier serializes PCIe traffic
+        // that would otherwise overlap hot compute (M7b-B fixes that).
+        let arena_enabled = match std::env::var("MOE_ARENA").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => !layers.iter().any(|l| l.gate_exps.hot.is_some()),
+        };
 
         let batch = Some(gpu.create_batch(8192, 49152)?);
 
@@ -678,6 +789,7 @@ impl MoeModel {
             p_rope,
             p_topk,
             p_reduce,
+            p_gather,
             layers,
             output_norm,
             head,
@@ -699,6 +811,9 @@ impl MoeModel {
             blogits,
             bpos,
             bdummy,
+            barena_g,
+            barena_u,
+            barena_d,
             batch,
             n_ctx_max,
             n_past: 0,
@@ -712,6 +827,7 @@ impl MoeModel {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2),
             repin_swaps: 0,
+            arena_enabled,
             slab_bytes: ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
                 .iter()
                 .map(|s| {
@@ -886,9 +1002,19 @@ impl MoeModel {
             .unwrap();
     }
 
-    /// Expert matvec with hot/cold split: when the layer has a dense hot
-    /// buffer, dispatch twice (hot ids into the VRAM copy, cold ids into
-    /// the GTT tensor) — disjoint slots, so no barrier between the pair.
+    /// Arena reference gated by MOE_ARENA (None -> cold path reads the
+    /// in-place tensor). Borrow-checked helper for the matvec call sites.
+    fn arena_ref<'a>(&'a self, b: &'a Option<Buffer>) -> Option<&'a Buffer> {
+        if self.arena_enabled { b.as_ref() } else { None }
+    }
+
+    /// Expert matvec with hot/cold split. `arena` is the M7b-A VRAM
+    /// scratch buffer for this tensor (None when experts are not in GTT):
+    ///   arena  -> cold slots read the gathered arena, driven by the SLOT
+    ///             id row (base+192): slot index == arena expert id
+    ///   no arena -> cold slots read the full (VRAM) tensor via cold ids
+    /// Hot slots read the dense hot VRAM buffer either way; all targets
+    /// write disjoint output slots, so no barrier inside the split.
     fn rec_matvec_id(
         &self,
         batch: &mut Batch,
@@ -898,15 +1024,63 @@ impl MoeModel {
         ne11: u32,
         barrier: bool,
         layer: usize,
+        arena: Option<&Buffer>,
     ) {
-        let base = (layer * 192) as u64;
-        match &w.hot {
-            Some(hot) => {
+        let base = (layer * 256) as u64;
+        match (&w.hot, arena) {
+            (Some(hot), Some(ar)) => {
+                self.rec_matvec_id_buf(batch, w, hot, x, y, ne11, false, base + 64);
+                self.rec_matvec_id_buf(batch, w, ar, x, y, ne11, barrier, base + 192);
+            }
+            (Some(hot), None) => {
                 self.rec_matvec_id_buf(batch, w, hot, x, y, ne11, false, base + 64);
                 self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base + 128);
             }
-            None => self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base),
+            (None, Some(ar)) => {
+                self.rec_matvec_id_buf(batch, w, ar, x, y, ne11, barrier, base + 192);
+            }
+            (None, None) => self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base),
         }
+    }
+
+    /// M7b-A: gather this layer's cold expert slabs GTT -> VRAM arenas.
+    /// Reads the cold id row (base+128); SKIP slots early-out. Must run
+    /// after the topk dispatch and before the cold matvecs (barrier).
+    fn rec_gather(
+        &self,
+        batch: &mut Batch,
+        ly: &Layer,
+        layer: usize,
+        arena_g: &Buffer,
+        arena_u: &Buffer,
+        arena_d: &Buffer,
+    ) {
+        let push = [
+            (ly.gate_exps.slab / 16) as u32,
+            (ly.up_exps.slab / 16) as u32,
+            (ly.down_exps.slab / 16) as u32,
+            0u32, // base_g: slab offset within tensor is e * slab only
+            0u32, // base_up
+            0u32, // base_d
+            0u32, // pad
+        ];
+        batch
+            .dispatch_ranges(
+                &self.gpu,
+                &self.p_gather,
+                &[
+                    (&ly.gate_exps.buf, 0, WHOLE),
+                    (&ly.up_exps.buf, 0, WHOLE),
+                    (&ly.down_exps.buf, 0, WHOLE),
+                    (arena_g, 0, WHOLE),
+                    (arena_u, 0, WHOLE),
+                    (arena_d, 0, WHOLE),
+                    (&self.bids, (layer * 256 + 128) as u64, WHOLE),
+                ],
+                as_bytes_of(&push),
+                (self.hp.n_expert_used as u32, 1, 1),
+            )
+            .unwrap();
     }
 
     fn rec_rms(
@@ -1143,13 +1317,30 @@ impl MoeModel {
                     &[
                         (&self.brouter, 0, WHOLE),
                         (&self.bweights, 0, WHOLE),
-                        (&self.bids, (l * 192) as u64, WHOLE),
+                        (&self.bids, (l * 256) as u64, WHOLE),
                         (&ly.remap, 0, WHOLE),
                     ],
-                    as_bytes(&[hp.n_expert as u32, k as u32]),
+                    as_bytes(&[
+                        hp.n_expert as u32,
+                        k as u32,
+                        if self.cfg.norm_topk { 1u32 } else { 0u32 },
+                    ]),
                     (1, 1, 1),
                 )
                 .unwrap();
+            // M7b-A: gather cold slabs GTT -> VRAM arenas (no-op when all
+            // experts are VRAM-resident or MOE_ARENA=0). Barrier included,
+            // so the cold matvecs below read coherent arena data.
+            let arenas = (
+                self.barena_g.as_ref(),
+                self.barena_u.as_ref(),
+                self.barena_d.as_ref(),
+            );
+            if self.arena_enabled {
+                if let (Some(ag), Some(au), Some(ad)) = arenas {
+                    self.rec_gather(&mut batch, ly, l, ag, au, ad);
+                }
+            }
             // expert gate/up (same x for all slots), swiglu, down (per-slot x)
             self.rec_matvec_id(
                 &mut batch,
@@ -1159,8 +1350,18 @@ impl MoeModel {
                 1,
                 false,
                 l,
+                self.arena_ref(&self.barena_g),
             );
-            self.rec_matvec_id(&mut batch, &ly.up_exps, &self.bnorm, &self.bup, 1, true, l);
+            self.rec_matvec_id(
+                &mut batch,
+                &ly.up_exps,
+                &self.bnorm,
+                &self.bup,
+                1,
+                true,
+                l,
+                self.arena_ref(&self.barena_u),
+            );
             let glu = GluPush::split(n_ff as u32, k as u32);
             batch
                 .dispatch_ranges(
@@ -1183,6 +1384,7 @@ impl MoeModel {
                 k as u32,
                 true,
                 l,
+                self.arena_ref(&self.barena_d),
             );
             // weighted reduce into residual
             batch
@@ -1228,13 +1430,13 @@ impl MoeModel {
     pub fn last_expert_ids(&self) -> Vec<Vec<u32>> {
         let n_layers = self.hp.base.n_layers;
         let k = self.hp.n_expert_used;
-        let mut raw = vec![0u8; n_layers * 192];
+        let mut raw = vec![0u8; n_layers * 256];
         self.gpu.download(&self.bids, &mut raw).unwrap();
         (0..n_layers)
             .map(|l| {
                 (0..k)
                     .map(|i| {
-                        let o = l * 192 + i * 4;
+                        let o = l * 256 + i * 4;
                         u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
                     })
                     .collect()

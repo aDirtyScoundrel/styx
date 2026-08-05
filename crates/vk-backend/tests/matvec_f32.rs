@@ -1,8 +1,8 @@
 //! mul_mat_vec_f32_f32 ABI validation (needed for GPU attention scores/values).
 //! Gated behind MOE_GPU_TESTS=1.
 
-use vk_backend::ops::MatVecPush;
 use vk_backend::Gpu;
+use vk_backend::ops::MatVecPush;
 
 const SPV_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

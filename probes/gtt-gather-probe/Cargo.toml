@@ -1,7 +1,7 @@
 [package]
 name = "gtt-gather-probe"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 ash = "0.38"

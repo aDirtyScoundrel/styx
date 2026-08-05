@@ -1,0 +1,4 @@
+# rustfmt edition must match the crates' editions (2021/2024) or rustfmt
+# parses with its 2015 default and rejects modern syntax (c"..." literals,
+# let-else, etc.), producing false lint failures on valid code.
+edition = "2024"

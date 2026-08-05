@@ -337,6 +337,31 @@ impl Gpu {
         })
     }
 
+    /// Total bytes of DEVICE_LOCAL heap (VRAM) backing the discrete GPU.
+    /// Used by the model loader to size expert budgets dynamically instead
+    /// of hard-coding a 24 GB assumption. Returns 0 if none reported.
+    pub fn vram_bytes(&self) -> u64 {
+        // A memory type is DEVICE_LOCAL iff it sits on a DEVICE_LOCAL heap
+        // on every conformant driver; sum distinct device-local heaps.
+        let mut total = 0u64;
+        let mut seen = [false; 32];
+        for i in 0..self.mem_props.memory_type_count as usize {
+            let mt = &self.mem_props.memory_types[i];
+            if !mt
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            {
+                continue;
+            }
+            let h = mt.heap_index as usize;
+            if h < seen.len() && !seen[h] {
+                seen[h] = true;
+                total += self.mem_props.memory_heaps[h].size;
+            }
+        }
+        total
+    }
+
     fn find_mem_type_not(
         &self,
         bits: u32,

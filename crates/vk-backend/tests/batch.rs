@@ -1,8 +1,8 @@
 //! Batch recorder validation: many chained dispatches, one submit/fence.
 //! Gated behind MOE_GPU_TESTS=1.
 
-use vk_backend::ops::BinaryPush;
 use vk_backend::Gpu;
+use vk_backend::ops::BinaryPush;
 
 const SPV_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
