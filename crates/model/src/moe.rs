@@ -17,7 +17,7 @@ use gguf_rs::Gguf;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use vk_backend::ops::{BinaryPush, GluPush, MatVecIdPush, MatVecPush, RopePush, UnaryPush};
-use vk_backend::{Batch, Buffer, Gpu, Pipeline};
+use vk_backend::{Batch, Buffer, Gpu, Pipeline, ash_vk};
 
 const QK_K: usize = 256;
 
@@ -217,6 +217,40 @@ pub struct MoeModel {
     /// PCIe gather that would otherwise overlap hot compute, so the
     /// in-place cold path is faster there; overlap needs M7b-B).
     arena_enabled: bool,
+    /// M7b-B async prefetch. MOE_PREFETCH=0 off, =1 force on, unset auto
+    /// (on iff arena_enabled AND a second compute family exists).
+    prefetch: bool,
+    /// Async gather batch (family async_qfam) + timeline semaphore.
+    /// prefetch_sem value v: all gathers for token v are complete.
+    async_batch: Option<Batch>,
+    prefetch_sem: Option<ash_vk::Semaphore>,
+    sem_counter: u64,
+    /// Per-layer prefetch prediction ids (k u32 each), uploaded to
+    /// bpf_ids before the async gather reads them. Predicted from the
+    /// previous token's routed experts.
+    bpf_ids: Buffer,
+    /// Per-layer pmap (n_expert u32: expert -> arena slot or SKIP),
+            /// built host-side from the prediction, uploaded each token.
+            bpmaps: Buffer,
+            /// Double-buffered pmap: we upload to the inactive one while the
+            /// active one is read by the other queue's topk. Swapped after the
+            /// next token's topk consumes it. Avoids in-place HOST_COHERENT
+            /// update while the GPU may be reading (RADV cache coherency bug).
+            bpmaps_alt: Buffer,
+            /// Host mirror of the current pmap (n_layers x n_expert u32).
+            pmap_host: Vec<u32>,
+    /// Host mirror of the prediction ids (n_layers x 64 u32, 256B stride).
+    pf_ids_host: Vec<u32>,
+    /// Timeline value the NEXT forward_token's batch must wait on for the
+    /// in-flight prefetch (0 = none).
+    prefetch_wait_val: u64,
+    /// Arena geometry: per FFN tensor (gate,up,down) the MAX slab across
+    /// layers in bytes (arena slots pad to this) and in uvec4 count
+    /// (gather dst stride). Mixed-quant layers vary in bytes; the arena
+    /// always pads to the max so slot math is uniform. The arena matvec's
+    /// batch_stride_a is derived per layer from bytes + that layer's type.
+    arena_slab_bytes: [u64; 3],
+    arena_slab_v: [usize; 3],
     /// Max slab swaps per layer per repin event (MOE_REPIN_MAX, default 2).
     repin_max: usize,
     /// Total expert slabs swapped in by repinning so far.
@@ -398,9 +432,9 @@ impl MoeModel {
             std::mem::size_of::<RopePush>() as u32,
             &[],
         )?;
-        let p_topk = gpu.create_pipeline(&ours("topk_softmax_f32"), 4, 12, &[])?;
+        let p_topk = gpu.create_pipeline(&ours("topk_softmax_f32"), 5, 12, &[])?;
         let p_reduce = gpu.create_pipeline(&ours("moe_reduce_f32"), 3, 8, &[])?;
-        let p_gather = gpu.create_pipeline(&ours("gather_slabs_f32"), 7, 28, &[])?;
+        let p_gather = gpu.create_pipeline(&ours("gather_slabs_f32"), 7, 36, &[])?;
 
         // Expert placement policy:
         //   default              -> AUTO budget: greedily fill device VRAM
@@ -429,21 +463,22 @@ impl MoeModel {
             .sum();
         //   KV at full context: 2 caches x n_layers x n_ctx x kv_dim f32
         let kv_max_bytes = (n_layers * 2 * n_ctx_max * n_kv_heads * head_dim * 4) as u64;
-        //   M7b-A arena: k x max slab over layers (allocated iff any expert
-        //   spills to GTT; reserved here because auto usually spills).
-        let max_slab_sum: u64 = (0..n_layers)
-            .map(|l| {
-                ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
-                    .iter()
-                    .map(|s| {
+        //   Arena (M7b-B): n_layers x k slots, each padded to the per-tensor
+        //   MAX slab across layers (allocated iff any expert spills to GTT;
+        //   reserved here because auto usually spills).
+        let max_slab_sum: u64 = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+            .iter()
+            .map(|s| {
+                (0..n_layers)
+                    .map(|l| {
                         let t = &tmap[&format!("blk.{l}.{s}.weight")];
                         t.size_bytes / n_expert as u64
                     })
-                    .sum::<u64>()
+                    .max()
+                    .unwrap_or(0)
             })
-            .max()
-            .unwrap_or(0);
-        let arena_bytes = n_expert_used as u64 * max_slab_sum;
+            .sum();
+        let arena_bytes = n_layers as u64 * n_expert_used as u64 * max_slab_sum;
         let headroom_mb: u64 = std::env::var("MOE_HEADROOM_MB")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -559,7 +594,7 @@ impl MoeModel {
                     vram_used.set(vram_used.get() + hb.len() as u64);
                     Some(b)
                 };
-                let hb = (gpu.create_buffer_host(t.size_bytes)?, hot_buf);
+                let hb = (gpu.create_buffer_host_shared(t.size_bytes)?, hot_buf);
                 experts_in_gtt.set(true);
                 hb
             } else if vram_left.get() >= t.size_bytes {
@@ -567,7 +602,10 @@ impl MoeModel {
                 vram_used.set(vram_used.get() + t.size_bytes);
                 (gpu.create_buffer(t.size_bytes, true)?, None)
             } else {
-                let hb = (gpu.create_buffer_host(t.size_bytes)?, None);
+                // Shared (CONCURRENT) so the async prefetch gather on the
+                // second queue family can read it; falls back to a plain
+                // host buffer when the device has only one compute family.
+                let hb = (gpu.create_buffer_host_shared(t.size_bytes)?, None);
                 experts_in_gtt.set(true);
                 hb
             };
@@ -700,6 +738,8 @@ impl MoeModel {
         let q_dim = n_heads * head_dim;
         let k = n_expert_used;
         let mk = |n: usize| gpu.create_buffer((n * 4) as u64, true);
+        let force_gtt = std::env::var("MOE_FORCE_GTT").is_ok();
+        let no_pmap_reupload = std::env::var("MOE_NO_PMAP_REUPLOAD").is_ok();
         let bx = mk(n_embd)?;
         let bnorm = mk(n_embd)?;
         let bq = mk(q_dim)?;
@@ -709,8 +749,14 @@ impl MoeModel {
         let bproj = mk(n_embd)?;
         let brouter = mk(n_expert)?;
         let bweights = mk(k)?;
-        // 4 rows x 64B per layer: [orig ids | hot ids | cold ids | slot ids]
-        let bids = mk(n_layers * 64)?;
+        // M7b-B: 4 rows x 64 i32 = 256B per layer
+        // [orig ids | hot ids | arena ids | gtt ids], 256B stride (matches
+        // the topk writes at l*256 and last_expert_ids' download size).
+        let bids = if force_gtt {
+            gpu.create_buffer_host((n_layers * 256) as u64)?
+        } else {
+            mk(n_layers * 256)?
+        };
         let bgate = mk(k * n_ff_exp)?;
         let bup = mk(k * n_ff_exp)?;
         let bdown = mk(k * n_embd)?;
@@ -718,10 +764,11 @@ impl MoeModel {
         let bpos = mk(1)?;
         let bdummy = mk(1)?;
 
-        // M7b-A scratch arenas (only when experts live in GTT): k slabs
-        // each, device-local VRAM, reused every layer. Mixed-quant models
-        // can vary slab size per layer, so size from the MAX slab across
-        // all layers — the gather strides by the actual per-layer size.
+        // Scratch arenas (only when experts live in GTT). M7b-B: sized
+        // n_layers x k slots (layer-major) so an async prefetch can fill
+        // the whole token's predicted experts between tokens. Slot
+        // (layer, s) = layer * k + s. Mixed-quant models vary slab size
+        // per layer, so size from the MAX slab across all layers.
         let (barena_g, barena_u, barena_d) = if experts_in_gtt.get() {
             let max_slab = |prefix: &str| -> u64 {
                 (0..n_layers)
@@ -735,9 +782,11 @@ impl MoeModel {
             let ab = |prefix: &str| -> Result<Buffer, String> {
                 let slab = max_slab(prefix);
                 assert!(slab % 16 == 0, "{prefix}_exps slab not 16B-aligned");
-                let bytes = k as u64 * slab;
+                let bytes = n_layers as u64 * k as u64 * slab;
                 vram_used.set(vram_used.get() + bytes);
-                gpu.create_buffer(bytes, false)
+                // CONCURRENT: the async gather queue writes these while
+                // the main queue reads them (ordered by the timeline sem).
+                gpu.create_buffer_shared(bytes, false)
             };
             (
                 Some(ab("ffn_gate")?),
@@ -749,13 +798,84 @@ impl MoeModel {
         };
 
         // Auto arena: on only for pure-GTT placement (no hot buffers).
-        // With hot/cold pinning the gather barrier serializes PCIe traffic
-        // that would otherwise overlap hot compute (M7b-B fixes that).
+        // With hot/cold pinning the in-batch gather barrier serializes
+        // PCIe traffic that would otherwise overlap hot compute — the
+        // pinned regime uses M7b-B async prefetch instead.
         let arena_enabled = match std::env::var("MOE_ARENA").as_deref() {
             Ok("1") => true,
             Ok("0") => false,
             _ => !layers.iter().any(|l| l.gate_exps.hot.is_some()),
         };
+
+        // M7b-B async prefetch: on iff there is a GTT expert tier AND a
+        // second compute family to run the gather on. MOE_PREFETCH forces.
+        let (async_batch, prefetch_sem) = if experts_in_gtt.get() && gpu.async_qfam.is_some() {
+            (
+                Some(gpu.create_async_batch(1024, 8192)?),
+                Some(gpu.create_timeline_semaphore()?),
+            )
+        } else {
+            (None, None)
+        };
+        // M7b-B NOTE (2026-08-06): prefetch was auto-enabled here whenever a
+        // second compute family existed, but the async-gather path has an
+        // unresolved correctness bug (topk writes to cold layers vanish — see
+        // Obsidian vault "M7b-B Session Handoff.md"). Correctness first:
+        // default OFF; MOE_PREFETCH=1 opts in for debugging/benchmarking.
+        let prefetch = match std::env::var("MOE_PREFETCH").as_deref() {
+            Ok("1") => {
+                assert!(
+                    async_batch.is_some(),
+                    "MOE_PREFETCH=1 requires experts in GTT + a second compute family"
+                );
+                true
+            }
+            _ => false,
+        };
+        // pmaps always cover all layers (topk binds a per-layer offset);
+        // all-SKIP content means "nothing prefetched" — every cold expert
+        // falls to the in-place GTT row. Prediction ids only needed when
+        // prefetch actually runs.
+        let bpmaps = if force_gtt {
+            gpu.create_buffer_host(n_layers as u64 * n_expert as u64 * 4)?
+        } else {
+            gpu.create_buffer(n_layers as u64 * n_expert as u64 * 4, true)?
+        };
+        gpu.upload_staged(&bpmaps, &vec![0xFFu8; n_layers * n_expert * 4])?;
+        // Double-buffered pmap: inactive copy for upload, swapped after next token's topk.
+        let bpmaps_alt = if force_gtt {
+            gpu.create_buffer_host(n_layers as u64 * n_expert as u64 * 4)?
+        } else {
+            gpu.create_buffer(n_layers as u64 * n_expert as u64 * 4, true)?
+        };
+        gpu.upload_staged(&bpmaps_alt, &vec![0xFFu8; n_layers * n_expert * 4])?;
+        let bpf_ids = if prefetch {
+            // prediction ids: 16 i32 slots per layer (64B row, 256B stride).
+            // CONCURRENT: read by the family-1 async gather queue.
+            if force_gtt {
+                gpu.create_buffer_host_shared(n_layers as u64 * 256)?
+            } else {
+                gpu.create_buffer_shared(n_layers as u64 * 256, true)?
+            }
+        } else {
+            gpu.create_buffer(1, true)?
+        };
+
+        // Arena geometry: max slab per FFN tensor across layers.
+        let arena_geom = |prefix: &str| -> (u64, usize) {
+            let mut max_b = 0u64;
+            let mut max_v = 0usize;
+            for l in 0..n_layers {
+                let t = &tmap[&format!("blk.{l}.{prefix}_exps.weight")];
+                let b = t.size_bytes / n_expert as u64;
+                max_b = max_b.max(b);
+                max_v = max_v.max((b / 16) as usize);
+            }
+            (max_b, max_v)
+        };
+        let (gb, gv) = arena_geom("ffn_gate");
+        let (ub, uv) = arena_geom("ffn_up");
+        let (db, dv) = arena_geom("ffn_down");
 
         let batch = Some(gpu.create_batch(8192, 49152)?);
 
@@ -828,6 +948,20 @@ impl MoeModel {
                 .unwrap_or(2),
             repin_swaps: 0,
             arena_enabled,
+            prefetch,
+            async_batch,
+            prefetch_sem,
+            sem_counter: 0,
+            bpf_ids,
+            bpmaps,
+            bpmaps_alt,
+            pmap_host: vec![u32::MAX; n_layers * n_expert],
+            // bpf_ids uses 256B (64 u32) stride per layer to match the
+            // gather's per-layer row binding.
+            pf_ids_host: vec![u32::MAX; n_layers * 64],
+            prefetch_wait_val: 0,
+            arena_slab_bytes: [gb, ub, db],
+            arena_slab_v: [gv, uv, dv],
             slab_bytes: ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
                 .iter()
                 .map(|s| {
@@ -953,8 +1087,11 @@ impl MoeModel {
 
     /// Expert matvec: for each of the k selected experts (ids buffer),
     /// y[slot] = W[expert] * x[slot % ne11]. `wbuf` is the weight buffer to
-    /// read (full GTT tensor or dense hot VRAM buffer); `ids_off` selects
-    /// which id row drives the dispatch (slots with SKIP ids early-out).
+    /// read (full GTT tensor, dense hot VRAM buffer, or the arena);
+    /// `ids_off` selects which id row drives the dispatch (slots with SKIP
+    /// ids early-out). `stride_a_elems` overrides batch_stride_a for arena
+    /// reads (arena slots pad to the max slab across layers, so the stride
+    /// is the arena slab in elements, not this layer's own nrows*ncols).
     #[allow(clippy::too_many_arguments)]
     fn rec_matvec_id_buf(
         &self,
@@ -966,6 +1103,7 @@ impl MoeModel {
         ne11: u32,
         barrier: bool,
         ids_off: u64,
+        stride_a_elems: Option<u32>,
     ) {
         let k = self.hp.n_expert_used as u32;
         let pipe = &self.mmv_id[&w.ggml_type];
@@ -974,7 +1112,7 @@ impl MoeModel {
             stride_a: (w.ncols / quant_k(w.ggml_type)) as u32,
             stride_b: w.ncols as u32,
             stride_d: w.nrows as u32,
-            batch_stride_a: (w.nrows * w.ncols) as u32,
+            batch_stride_a: stride_a_elems.unwrap_or((w.nrows * w.ncols) as u32),
             batch_stride_b: w.ncols as u32,
             batch_stride_d: k * w.nrows as u32,
             fusion_flags: 0,
@@ -1002,19 +1140,47 @@ impl MoeModel {
             .unwrap();
     }
 
-    /// Arena reference gated by MOE_ARENA (None -> cold path reads the
-    /// in-place tensor). Borrow-checked helper for the matvec call sites.
-    fn arena_ref<'a>(&'a self, b: &'a Option<Buffer>) -> Option<&'a Buffer> {
-        if self.arena_enabled { b.as_ref() } else { None }
+    /// Bytes per quant block (QUANT_K elements): q8_0=34, q4_K=144,
+    /// q5_K=176, q6_K=210. Derives arena strides from byte sizes.
+    fn block_bytes(t: u32) -> usize {
+        match t {
+            8 => 34,
+            12 => 144,
+            13 => 176,
+            14 => 210,
+            _ => panic!("unsupported ggml type {t}"),
+        }
     }
 
-    /// Expert matvec with hot/cold split. `arena` is the M7b-A VRAM
-    /// scratch buffer for this tensor (None when experts are not in GTT):
-    ///   arena  -> cold slots read the gathered arena, driven by the SLOT
-    ///             id row (base+192): slot index == arena expert id
-    ///   no arena -> cold slots read the full (VRAM) tensor via cold ids
-    /// Hot slots read the dense hot VRAM buffer either way; all targets
-    /// write disjoint output slots, so no barrier inside the split.
+    /// Arena batch_stride_a in elements for tensor index ti (0=gate,
+    /// 1=up, 2=down): every arena slot pads to arena_slab_bytes, so the
+    /// stride in THIS layer's quant blocks is ceil(slab/block_bytes),
+    /// times QUANT_K elements. ceil: max slab may not divide this layer's
+    /// block size (mixed quant).
+    fn arena_stride_elems(&self, ti: usize, w: &ExpMat) -> u32 {
+        let bb = Self::block_bytes(w.ggml_type);
+        let blocks = (self.arena_slab_bytes[ti] as usize).div_ceil(bb);
+        (blocks * quant_k(w.ggml_type)) as u32
+    }
+
+    fn arena_buf(&self, ti: usize) -> &Buffer {
+        match ti {
+            0 => self.barena_g.as_ref().unwrap(),
+            1 => self.barena_u.as_ref().unwrap(),
+            _ => self.barena_d.as_ref().unwrap(),
+        }
+    }
+
+    /// Expert matvec with the three-way cold split (M7b-B). The topk
+    /// shader partitions the k routed experts into disjoint rows:
+    ///   row 1 (base+64):  hot   -> dense VRAM hot buffer (pinned regime)
+    ///   row 2 (base+128): arena -> prefetched arena slot (global id
+    ///                              layer*k+slot, so a_offset lands in this
+    ///                              layer's arena region)
+    ///   row 3 (base+192): gtt   -> in-place GTT tensor (misses fall here)
+    /// SKIP early-out makes the dispatches write disjoint output slots —
+    /// no barriers between them. With prefetch off, pmap is all-SKIP so
+    /// the arena row is empty and every cold expert hits the GTT row.
     fn rec_matvec_id(
         &self,
         batch: &mut Batch,
@@ -1024,28 +1190,54 @@ impl MoeModel {
         ne11: u32,
         barrier: bool,
         layer: usize,
-        arena: Option<&Buffer>,
+        ti: usize,
     ) {
         let base = (layer * 256) as u64;
-        match (&w.hot, arena) {
-            (Some(hot), Some(ar)) => {
-                self.rec_matvec_id_buf(batch, w, hot, x, y, ne11, false, base + 64);
-                self.rec_matvec_id_buf(batch, w, ar, x, y, ne11, barrier, base + 192);
+        let arena_ok = self.barena_g.is_some();
+        match (&w.hot, arena_ok) {
+            (Some(hot), true) => {
+                self.rec_matvec_id_buf(batch, w, hot, x, y, ne11, false, base + 64, None);
+                self.rec_matvec_id_buf(
+                    batch,
+                    w,
+                    self.arena_buf(ti),
+                    x,
+                    y,
+                    ne11,
+                    false,
+                    base + 128,
+                    Some(self.arena_stride_elems(ti, w)),
+                );
+                self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base + 192, None);
             }
-            (Some(hot), None) => {
-                self.rec_matvec_id_buf(batch, w, hot, x, y, ne11, false, base + 64);
-                self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base + 128);
+            (Some(hot), false) => {
+                self.rec_matvec_id_buf(batch, w, hot, x, y, ne11, false, base + 64, None);
+                self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base + 192, None);
             }
-            (None, Some(ar)) => {
-                self.rec_matvec_id_buf(batch, w, ar, x, y, ne11, barrier, base + 192);
+            (None, true) => {
+                self.rec_matvec_id_buf(
+                    batch,
+                    w,
+                    self.arena_buf(ti),
+                    x,
+                    y,
+                    ne11,
+                    false,
+                    base + 128,
+                    Some(self.arena_stride_elems(ti, w)),
+                );
+                self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base + 192, None);
             }
-            (None, None) => self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base),
+            (None, false) => {
+                self.rec_matvec_id_buf(batch, w, &w.buf, x, y, ne11, barrier, base, None)
+            }
         }
     }
 
-    /// M7b-A: gather this layer's cold expert slabs GTT -> VRAM arenas.
-    /// Reads the cold id row (base+128); SKIP slots early-out. Must run
-    /// after the topk dispatch and before the cold matvecs (barrier).
+    /// Record the M7b-B async gather for one layer: predicted experts
+    /// (bpf_ids) -> arena slot (layer*k+s). Reads the prediction row, not
+    /// bids. dst stride = arena slab (max across layers), src stride =
+    /// this layer's own slab. Called into the ASYNC batch between tokens.
     fn rec_gather(
         &self,
         batch: &mut Batch,
@@ -1055,14 +1247,17 @@ impl MoeModel {
         arena_u: &Buffer,
         arena_d: &Buffer,
     ) {
+        let canary = std::env::var("MOE_PF_CANARY").is_ok();
         let push = [
+            self.arena_slab_v[0] as u32,
+            self.arena_slab_v[1] as u32,
+            self.arena_slab_v[2] as u32,
             (ly.gate_exps.slab / 16) as u32,
             (ly.up_exps.slab / 16) as u32,
             (ly.down_exps.slab / 16) as u32,
-            0u32, // base_g: slab offset within tensor is e * slab only
-            0u32, // base_up
-            0u32, // base_d
-            0u32, // pad
+            layer as u32,
+            self.hp.n_expert_used as u32,
+            if canary { 1u32 } else { 0u32 },
         ];
         batch
             .dispatch_ranges(
@@ -1075,7 +1270,7 @@ impl MoeModel {
                     (arena_g, 0, WHOLE),
                     (arena_u, 0, WHOLE),
                     (arena_d, 0, WHOLE),
-                    (&self.bids, (layer * 256 + 128) as u64, WHOLE),
+                    (&self.bpf_ids, (layer * 256) as u64, WHOLE),
                 ],
                 as_bytes_of(&push),
                 (self.hp.n_expert_used as u32, 1, 1),
@@ -1309,7 +1504,7 @@ impl MoeModel {
                     (ly.router.nrows as u32, 1, 1),
                 )
                 .unwrap();
-            // top-k softmax with renorm + hot/cold id split via remap table
+            // top-k softmax with renorm + hot/arena/gtt id split
             batch
                 .dispatch_ranges(
                     &self.gpu,
@@ -1317,8 +1512,9 @@ impl MoeModel {
                     &[
                         (&self.brouter, 0, WHOLE),
                         (&self.bweights, 0, WHOLE),
-                        (&self.bids, (l * 256) as u64, WHOLE),
+                        (&self.bids, (l * 256) as u64, 256),
                         (&ly.remap, 0, WHOLE),
+                        (&self.bpmaps, (l * hp.n_expert * 4) as u64, (hp.n_expert * 4) as u64),
                     ],
                     as_bytes(&[
                         hp.n_expert as u32,
@@ -1331,37 +1527,11 @@ impl MoeModel {
             // M7b-A: gather cold slabs GTT -> VRAM arenas (no-op when all
             // experts are VRAM-resident or MOE_ARENA=0). Barrier included,
             // so the cold matvecs below read coherent arena data.
-            let arenas = (
-                self.barena_g.as_ref(),
-                self.barena_u.as_ref(),
-                self.barena_d.as_ref(),
-            );
-            if self.arena_enabled {
-                if let (Some(ag), Some(au), Some(ad)) = arenas {
-                    self.rec_gather(&mut batch, ly, l, ag, au, ad);
-                }
-            }
-            // expert gate/up (same x for all slots), swiglu, down (per-slot x)
-            self.rec_matvec_id(
-                &mut batch,
-                &ly.gate_exps,
-                &self.bnorm,
-                &self.bgate,
-                1,
-                false,
-                l,
-                self.arena_ref(&self.barena_g),
-            );
-            self.rec_matvec_id(
-                &mut batch,
-                &ly.up_exps,
-                &self.bnorm,
-                &self.bup,
-                1,
-                true,
-                l,
-                self.arena_ref(&self.barena_u),
-            );
+            // expert gate/up (same x for all slots), swiglu, down (per-slot x).
+            // Cold experts read the prefetched arena (pmap hits) or fall
+            // back to in-place GTT (pmap misses) — see rec_matvec_id.
+            self.rec_matvec_id(&mut batch, &ly.gate_exps, &self.bnorm, &self.bgate, 1, false, l, 0);
+            self.rec_matvec_id(&mut batch, &ly.up_exps, &self.bnorm, &self.bup, 1, true, l, 1);
             let glu = GluPush::split(n_ff as u32, k as u32);
             batch
                 .dispatch_ranges(
@@ -1384,7 +1554,7 @@ impl MoeModel {
                 k as u32,
                 true,
                 l,
-                self.arena_ref(&self.barena_d),
+                2,
             );
             // weighted reduce into residual
             batch
@@ -1412,7 +1582,56 @@ impl MoeModel {
         );
         self.rec_matvec_b(&mut batch, &self.head, &self.bnorm, &self.blogits, true);
 
-        batch.submit(&self.gpu).unwrap();
+        // PRE-SUBMIT snapshot: bids is written by topk (recorded above). If
+        // valid here but corrupt after the fence, the GPU execution of this
+        // batch (or the async prefetch) is the culprit.
+        if std::env::var("MOE_PF_DBG").is_ok() {
+            let nl = self.hp.base.n_layers;
+            let mut raw = vec![0u8; nl * 256];
+            self.gpu.download(&self.bids, &mut raw).unwrap();
+            let bad = (0..nl)
+                .filter(|&l| u32::from_le_bytes([raw[l * 256], raw[l * 256 + 1], raw[l * 256 + 2], raw[l * 256 + 3]]) == u32::MAX)
+                .count();
+            eprintln!("pf-dbg pre-submit corrupt_layers={bad}");
+        }
+
+        // M7b-B: if a prefetch is in flight, this batch waits on its
+        // timeline value so the arena reads see gathered data.
+        if self.prefetch_wait_val > 0 {
+            let sem = self.prefetch_sem.unwrap();
+            let val = self.prefetch_wait_val;
+            batch.submit_wait_sem(&self.gpu, sem, val).unwrap();
+            self.prefetch_wait_val = 0;
+        } else {
+            batch.submit(&self.gpu).unwrap();
+        }
+        if std::env::var("MOE_PF_DBG").is_ok() {
+            // post-fence bids snapshot: corrupted here => GPU-side cause
+            let n_layers = self.hp.base.n_layers;
+            let mut raw = vec![0u8; n_layers * 256];
+            self.gpu.download(&self.bids, &mut raw).unwrap();
+            let row0_ff = |l: usize| {
+                u32::from_le_bytes([
+                    raw[l * 256],
+                    raw[l * 256 + 1],
+                    raw[l * 256 + 2],
+                    raw[l * 256 + 3],
+                ]) == u32::MAX
+            };
+            let bad = (0..n_layers).filter(|&l| row0_ff(l)).count();
+            eprintln!("pf-dbg post-submit corrupt_layers={bad}");
+            if bad > 0 {
+                for l in [4usize, 5, 47] {
+                    let row: Vec<u32> = (0..64)
+                        .map(|i| {
+                            let o = l * 256 + i * 4;
+                            u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
+                        })
+                        .collect();
+                    eprintln!("pf-dbg layer {l} full256={row:?}");
+                }
+            }
+        }
         self.batch = Some(batch);
         self.n_past += 1;
 
@@ -1422,7 +1641,255 @@ impl MoeModel {
                 std::slice::from_raw_parts_mut(logits.as_mut_ptr() as *mut u8, logits.len() * 4)
             })
             .unwrap();
+        // M7b-B: now that this token's routing is final (fence waited),
+        // prefetch its experts for the NEXT token while the host idles.
+        self.prepare_prefetch();
+        if std::env::var("MOE_PF_DBG").is_ok() {
+            // post-PREFETCH snapshot: bids right after the async gather was
+            // submitted (still in flight unless MOE_PF_SYNC). Corrupt here
+            // => the gather itself clobbers bids.
+            let nl = self.hp.base.n_layers;
+            let mut raw = vec![0u8; nl * 256];
+            self.gpu.download(&self.bids, &mut raw).unwrap();
+            let bad = (0..nl)
+                .filter(|&l| {
+                    u32::from_le_bytes([
+                        raw[l * 256],
+                        raw[l * 256 + 1],
+                        raw[l * 256 + 2],
+                        raw[l * 256 + 3],
+                    ]) == u32::MAX
+                })
+                .count();
+            eprintln!("pf-dbg post-prefetch corrupt_layers={bad}");
+        }
         logits
+    }
+
+    /// M7b-B prefetch state machine. Called after each token's fence:
+    /// predicts the next token's experts (the token just routed — overlap
+    /// mean 0.51), builds per-layer pmaps + prediction ids, records the
+    /// async gathers on the family-1 queue and signals the timeline
+    /// semaphore that the next token's batch will wait on.
+    ///
+    /// Correctness: predictions are only ever a speed optimization. A
+    /// prefetched-but-unrouted expert is never read (SKIP in the arena
+    /// row); a routed-but-unprefetched expert falls to the in-place GTT
+    /// row. Output is identical to no-prefetch.
+    fn prepare_prefetch(&mut self) {
+        if !self.prefetch {
+            return;
+        }
+        let n_layers = self.hp.base.n_layers;
+        let k = self.hp.n_expert_used;
+        // Predict = this token's routed experts. Skip experts that are
+        // hot (they never touch the arena) and dedupe per layer.
+        let ids = self.last_expert_ids();
+        if std::env::var("MOE_PF_DBG").is_ok() {
+            for l in 0..n_layers {
+                eprintln!("pf-dbg layer {} row0={:?}", l, &ids[l]);
+            }
+        }
+        for l in 0..n_layers {
+            let ly = &self.layers[l];
+            // reset this layer's pmap to all-SKIP
+            for e in 0..self.hp.n_expert {
+                self.pmap_host[l * self.hp.n_expert + e] = u32::MAX;
+            }
+            // MOE_PF_CANARY_PMAP: stamp a distinctive value into the pmap
+            // host vector; if it appears in bids, the leak is proven.
+            if std::env::var("MOE_PF_CANARY_PMAP").is_ok() {
+                self.pmap_host[l * self.hp.n_expert] = 0x0BADF00D;
+            }
+            let mut n_pf = 0usize;
+            for s in 0..k {
+                let e = ids[l][s] as usize;
+                if e >= self.hp.n_expert {
+                    eprintln!(
+                        "pf-dbg layer {} slot {} id={:#x} row={:?}",
+                        l, s, ids[l][s], &ids[l]
+                    );
+                    panic!("SKIP in bids row 0");
+                }
+                if ly.hot_mask[e] {
+                    continue; // hot experts read the dense hot buffer
+                }
+                if self.pmap_host[l * self.hp.n_expert + e] != u32::MAX {
+                    continue; // duplicate slot this layer
+                }
+                let slot = l * k + n_pf; // GLOBAL arena slot
+                self.pmap_host[l * self.hp.n_expert + e] = slot as u32;
+                self.pf_ids_host[l * 64 + n_pf] = e as u32;
+                n_pf += 1;
+            }
+            // pad remaining prediction slots with SKIP
+            for s in n_pf..k {
+                self.pf_ids_host[l * 64 + s] = u32::MAX;
+            }
+        }
+        // MOE_PF_FORCE_SKIP: overwrite every prediction id with SKIP so the
+        // gather shader dispatches + reads ids[] but performs ZERO arena
+        // writes (early-out). Isolates "dispatch/descriptor binding" from
+        // "arena write" as the corruption source.
+        if std::env::var("MOE_PF_FORCE_SKIP").is_ok() {
+            for v in self.pf_ids_host.iter_mut() {
+                *v = u32::MAX;
+            }
+        }
+        // upload pmaps + prediction ids (host-visible, cheap memcpy)
+        // MOE_PF_NO_UPLOAD: skip both uploads (isolation probe).
+        // MOE_PF_UPLOAD=pmaps|pfids: upload only that one.
+        let up = std::env::var("MOE_PF_UPLOAD").unwrap_or_default();
+        let no_up = std::env::var("MOE_PF_NO_UPLOAD").is_ok();
+        // upload pmap to the INACTIVE buffer, then swap so next token's topk sees it
+        // MOE_PF_NO_SWAP: upload directly to bpmaps (no double-buffer swap) to
+        // test whether the swap is implicated in bids corruption.
+        let no_swap = std::env::var("MOE_PF_NO_SWAP").is_ok();
+        let pmap_dst = if no_swap { &mut self.bpmaps } else { &mut self.bpmaps_alt };
+        // MOE_PF_HOST_UP: use host-memcpy upload() instead of GPU-copy
+        // upload_staged() for the pmap, to isolate whether the GPU transfer
+        // command is the corruption vector.
+        let host_up = std::env::var("MOE_PF_HOST_UP").is_ok();
+        if !no_up && up != "pfids" {
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    self.pmap_host.as_ptr() as *const u8,
+                    self.pmap_host.len() * 4,
+                )
+            };
+            if host_up {
+                self.gpu.upload(pmap_dst, src).unwrap();
+            } else {
+                self.gpu.upload_staged(pmap_dst, src).unwrap();
+            }
+            // swap active/inactive — next token's topk binds the new active pmap
+            if !no_swap {
+                std::mem::swap(&mut self.bpmaps, &mut self.bpmaps_alt);
+            }
+            if std::env::var("MOE_PF_DBG").is_ok() {
+                let va = self.gpu.device_address(&self.bpmaps);
+                let va_alt = self.gpu.device_address(&self.bpmaps_alt);
+                eprintln!("pf-dbg pmap swap: active bpmaps VA={va:#x}, inactive VA={va_alt:#x}");
+                // Download both pmaps to verify content
+                let nl = self.hp.base.n_layers;
+                let ne = self.hp.n_expert;
+                let mut raw_active = vec![0u8; nl * ne * 4];
+                let mut raw_inactive = vec![0u8; nl * ne * 4];
+                self.gpu.download(&self.bpmaps, &mut raw_active).unwrap();
+                self.gpu.download(&self.bpmaps_alt, &mut raw_inactive).unwrap();
+                let first_active = u32::from_le_bytes([raw_active[0], raw_active[1], raw_active[2], raw_active[3]]);
+                let first_inactive = u32::from_le_bytes([raw_inactive[0], raw_inactive[1], raw_inactive[2], raw_inactive[3]]);
+                eprintln!(
+                                    "pf-dbg pmap swap content: active[0]={first_active:#x}, inactive[0]={first_inactive:#x} (0xFF={:#x})",
+                                    0xFFFFFFFFu32
+                                );
+            }
+        }
+        if !no_up && up != "pmaps" {
+            self.gpu
+                .upload_staged(&self.bpf_ids, unsafe {
+                    std::slice::from_raw_parts(
+                        self.pf_ids_host.as_ptr() as *const u8,
+                        self.pf_ids_host.len() * 4,
+                    )
+                })
+                .unwrap();
+        }
+
+        // record async gathers for every layer into one command buffer
+        self.sem_counter += 1;
+        let wait_val = self.sem_counter;
+        if std::env::var("MOE_ADDR_DBG").is_ok() {
+            let va = |b: &Buffer| (self.gpu.device_address(b), b.size);
+            let (bs, bl) = va(&self.bids);
+            let (gs, gl) = va(&self.barena_g.as_ref().unwrap());
+            let (us, ul) = va(&self.barena_u.as_ref().unwrap());
+            let (ds, dl) = va(&self.barena_d.as_ref().unwrap());
+            let (ps, pl) = va(&self.bpmaps);
+            let (fs, fl) = va(&self.bpf_ids);
+            let (pas, pal) = va(&self.bpmaps_alt);
+            let rng = |a: u64, b: u64| format!("{a:#x}..{:#x}", a + b);
+            eprintln!(
+                "va-dbg bids {} | pmaps {} | pmapsALT {} | pfids {} | arenaG {} | arenaU {} | arenaD {}",
+                rng(bs, bl), rng(ps, pl), rng(pas, pal), rng(fs, fl), rng(gs, gl), rng(us, ul), rng(ds, dl)
+            );
+            let overlaps = |s1: u64, l1: u64, s2: u64, l2: u64| {
+                s1 < s2 + l2 && s2 < s1 + l1
+            };
+            for (name, s, l) in [
+                ("arenaG", gs, gl), ("arenaU", us, ul), ("arenaD", ds, dl),
+                ("pmaps", ps, pl), ("pmapsALT", pas, pal), ("pfids", fs, fl),
+            ] {
+                if overlaps(bs, bl, s, l) {
+                    eprintln!("VA OVERLAP: {name} {:#x}+{:#x} vs bids {:#x}+{:#x}", s, l, bs, bl);
+                }
+            }
+            // Physical-page aliasing check: export each small buffer's
+            // device memory as a DMA-buf fd; same inode = same pages.
+            for (name, b) in [
+                ("bids", &self.bids),
+                ("bpmaps", &self.bpmaps),
+                ("bpmaps_alt", &self.bpmaps_alt),
+                ("bpf_ids", &self.bpf_ids),
+                ("arenaG", self.barena_g.as_ref().unwrap()),
+                ("arenaU", self.barena_u.as_ref().unwrap()),
+                ("arenaD", self.barena_d.as_ref().unwrap()),
+            ] {
+                eprintln!(
+                    "mem-dbg {name}: buf={:#x} mem={:#x} size={}",
+                    self.gpu.raw_buffer_handle(b),
+                    self.gpu.raw_mem_handle(b),
+                    b.size
+                );
+                match self.gpu.memory_fd_info(b) {
+                    Ok((fd, ino, sz)) => {
+                        eprintln!("fd-dbg {name}: fd={fd} inode={ino} size={sz}");
+                    }
+                    Err(e) => eprintln!("fd-dbg {name}: ERR {e}"),
+                }
+            }
+        }
+        {
+            let mut abatch = self.async_batch.take().unwrap();
+            let (ag, au, ad) = (
+                self.barena_g.take().unwrap(),
+                self.barena_u.take().unwrap(),
+                self.barena_d.take().unwrap(),
+            );
+            abatch.begin(&self.gpu).unwrap();
+            // MOE_PF_NO_GATHER: still begin+submit (exercising the async
+            // machinery and semaphore) but record zero gather dispatches —
+            // isolates "async submit" from "gather writes" as the cause.
+            if std::env::var("MOE_PF_NO_GATHER").is_err() {
+                // MOE_PF_ONLY_LAYER=N: record a gather for only one layer
+                // (probe whether corruption scales with gather count).
+                let only: Option<usize> = std::env::var("MOE_PF_ONLY_LAYER")
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                for l in 0..n_layers {
+                    if let Some(o) = only {
+                        if l != o {
+                            continue;
+                        }
+                    }
+                    let ly = &self.layers[l];
+                    self.rec_gather(&mut abatch, ly, l, &ag, &au, &ad);
+                }
+            }
+            let sem = self.prefetch_sem.unwrap();
+            abatch.submit_async(&self.gpu, sem, wait_val).unwrap();
+            // MOE_PF_SYNC: block until the gather's fence signals — fully
+            // serializes the gather with the next token's host uploads and
+            // main-queue work. Clean result here => concurrency race.
+            if std::env::var("MOE_PF_SYNC").is_ok() {
+                abatch.wait_idle(&self.gpu).unwrap();
+            }
+            self.async_batch = Some(abatch);
+            self.barena_g = Some(ag);
+            self.barena_u = Some(au);
+            self.barena_d = Some(ad);
+        }
+        self.prefetch_wait_val = wait_val;
     }
 
     /// Selected expert ids from the LAST forward_token: n_layers rows of k ids.

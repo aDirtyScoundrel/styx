@@ -9,6 +9,10 @@
 use ash::vk;
 use std::path::Path;
 
+/// Re-export the raw Vulkan types callers need (e.g. vk::Semaphore for
+/// the M7b-B prefetch path) without forcing a direct ash dependency.
+pub use ash::vk as ash_vk;
+
 pub mod ops;
 
 pub struct Buffer {
@@ -42,6 +46,9 @@ pub struct Batch {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     recording: bool,
+    /// M7b-B: an async submit is in flight on this batch (fence pending).
+    /// begin() reaps it before re-recording.
+    pending: bool,
 }
 
 impl Batch {
@@ -49,6 +56,22 @@ impl Batch {
     pub fn begin(&mut self, gpu: &Gpu) -> Result<(), String> {
         assert!(!self.recording);
         unsafe {
+            // Reap a still-flight async submit before reusing the cb.
+            if self.pending {
+                gpu.device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .map_err(|e| e.to_string())?;
+                gpu.device
+                    .reset_fences(&[self.fence])
+                    .map_err(|e| e.to_string())?;
+                gpu.device
+                    .reset_command_buffer(self.cb, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| e.to_string())?;
+                gpu.device
+                    .reset_descriptor_pool(self.dpool, vk::DescriptorPoolResetFlags::empty())
+                    .map_err(|e| e.to_string())?;
+                self.pending = false;
+            }
             gpu.device
                 .begin_command_buffer(self.cb, &vk::CommandBufferBeginInfo::default())
                 .map_err(|e| e.to_string())?;
@@ -206,6 +229,108 @@ impl Batch {
             Ok(())
         }
     }
+
+    /// M7b-B: submit on the ASYNC queue, signaling a timeline semaphore
+    /// value. Returns immediately — completion is observed by whoever
+    /// waits on `sem >= val`. The batch must have been created with
+    /// create_async_batch (its cb belongs to the async pool).
+    pub fn submit_async(
+        &mut self,
+        gpu: &Gpu,
+        sem: vk::Semaphore,
+        val: u64,
+    ) -> Result<(), String> {
+        if !self.recording {
+            return Ok(());
+        }
+        let async_queue = gpu.async_queue.ok_or("no async queue family")?;
+        unsafe {
+            gpu.device
+                .end_command_buffer(self.cb)
+                .map_err(|e| e.to_string())?;
+            let cbs = [self.cb];
+            let signal_semaphores = [sem];
+            let signal_values = [val];
+            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+                .signal_semaphore_values(&signal_values);
+            let submit = [vk::SubmitInfo::default()
+                .command_buffers(&cbs)
+                .signal_semaphores(&signal_semaphores)
+                .push_next(&mut timeline)];
+            gpu.device
+                .queue_submit(async_queue, &submit, self.fence)
+                .map_err(|e| e.to_string())?;
+            // Non-blocking: the fence only guards cb reuse and is reaped
+            // by the next begin(). Overlap happens on the GPU — this
+            // gather streams while the main queue runs the next token's
+            // early layers; the token's batch waits on the semaphore.
+            self.recording = false;
+            self.pending = true;
+            Ok(())
+        }
+    }
+
+    /// Block until the async submit's fence signals, then reset it. Debug:
+    /// serializes the gather with everything after it (MOE_PF_SYNC probe).
+    pub fn wait_idle(&mut self, gpu: &Gpu) -> Result<(), String> {
+        if !self.pending {
+            return Ok(());
+        }
+        unsafe {
+            gpu.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| e.to_string())?;
+            gpu.device.reset_fences(&[self.fence]).map_err(|e| e.to_string())?;
+        }
+        self.pending = false;
+        Ok(())
+    }
+
+    /// M7b-B token path: like submit(), but the batch's first work waits
+    /// for the timeline semaphore to reach `val` (prefetch completion).
+    pub fn submit_wait_sem(
+        &mut self,
+        gpu: &Gpu,
+        sem: vk::Semaphore,
+        val: u64,
+    ) -> Result<(), String> {
+        if !self.recording {
+            return Ok(());
+        }
+        unsafe {
+            gpu.device
+                .end_command_buffer(self.cb)
+                .map_err(|e| e.to_string())?;
+            let cbs = [self.cb];
+            let wait_semaphores = [sem];
+            let wait_values = [val];
+            let wait_stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+            let mut timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values);
+            let submit = [vk::SubmitInfo::default()
+                .command_buffers(&cbs)
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .push_next(&mut timeline)];
+            gpu.device
+                .queue_submit(gpu.queue, &submit, self.fence)
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .reset_fences(&[self.fence])
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .reset_command_buffer(self.cb, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| e.to_string())?;
+            gpu.device
+                .reset_descriptor_pool(self.dpool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| e.to_string())?;
+            self.recording = false;
+            Ok(())
+        }
+    }
 }
 
 pub struct Gpu {
@@ -215,6 +340,12 @@ pub struct Gpu {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub qfam: u32,
+    /// Second COMPUTE family for async gathers (M7b-B), if one exists
+    /// beside the main family. None on single-family devices — callers
+    /// must fall back to the in-batch (serialized) path.
+    pub async_qfam: Option<u32>,
+    pub async_queue: Option<vk::Queue>,
+    async_cmd_pool: Option<vk::CommandPool>,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub device_name: String,
     cmd_pool: vk::CommandPool,
@@ -262,18 +393,41 @@ impl Gpu {
                         .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
                 })
                 .ok_or("no compute queue")? as u32;
+            // Second COMPUTE family for async gathers (M7b-B). Prefer a
+            // different family index so work can run truly concurrently;
+            // some drivers only expose one family (fallback = None).
+            let async_qfam = qfams
+                .iter()
+                .enumerate()
+                .position(|(i, q)| {
+                    i as u32 != qfam && q.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                })
+                .map(|i| i as u32);
 
             let prio = [1.0f32];
-            let qci = [vk::DeviceQueueCreateInfo::default()
+            let qci_main = vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qfam)
-                .queue_priorities(&prio)];
+                .queue_priorities(&prio);
+            let qci_async = vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(async_qfam.unwrap_or(0))
+                .queue_priorities(&prio);
+            let qci_all = [qci_main, qci_async];
+            let qcis = if async_qfam.is_some() {
+                &qci_all[..]
+            } else {
+                &qci_all[..1]
+            };
 
-            // Features the ggml shaders require.
+            // Features the ggml shaders require. timeline_semaphore is
+            // REQUIRED by M7b-B async prefetch (cross-queue ordering); the
+            // validation layer hard-errors if it is used while disabled.
             let mut f16i8 = vk::PhysicalDeviceVulkan12Features::default()
                 .shader_float16(true)
                 .shader_int8(true)
                 .storage_buffer8_bit_access(true)
-                .uniform_and_storage_buffer8_bit_access(true);
+                .uniform_and_storage_buffer8_bit_access(true)
+                .timeline_semaphore(true)
+                .buffer_device_address(true);
             let mut f11 = vk::PhysicalDeviceVulkan11Features::default()
                 .storage_buffer16_bit_access(true)
                 .uniform_and_storage_buffer16_bit_access(true);
@@ -281,9 +435,14 @@ impl Gpu {
                 .shader_int16(true)
                 .sparse_binding(true)
                 .sparse_residency_buffer(true);
+            // VK_KHR_external_memory_fd: lets us export a buffer's device
+            // memory as a DMA-buf fd so fd-dbg can detect physical-page
+            // aliasing between VkDeviceMemory allocations (inode compare).
+            let ext_names = [c"VK_KHR_external_memory_fd".as_ptr()];
             let dci = vk::DeviceCreateInfo::default()
-                .queue_create_infos(&qci)
+                .queue_create_infos(qcis)
                 .enabled_features(&features)
+                .enabled_extension_names(&ext_names)
                 .push_next(&mut f16i8)
                 .push_next(&mut f11);
             let device = instance
@@ -300,6 +459,23 @@ impl Gpu {
                     None,
                 )
                 .map_err(|e| e.to_string())?;
+
+            // Async gather queue + its own command pool (M7b-B).
+            let (async_queue, async_cmd_pool) = match async_qfam {
+                Some(f) => {
+                    let q = device.get_device_queue(f, 0);
+                    let p = device
+                        .create_command_pool(
+                            &vk::CommandPoolCreateInfo::default()
+                                .queue_family_index(f)
+                                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                            None,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    (Some(q), Some(p))
+                }
+                None => (None, None),
+            };
 
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
@@ -320,6 +496,9 @@ impl Gpu {
                 device,
                 queue,
                 qfam,
+                async_qfam,
+                async_queue,
+                async_cmd_pool,
                 mem_props,
                 device_name,
                 cmd_pool,
@@ -378,7 +557,8 @@ impl Gpu {
         unsafe {
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST;
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
             let buf = self
                 .device
                 .create_buffer(
@@ -407,6 +587,180 @@ impl Gpu {
                 self.find_mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
             }
             .ok_or("no matching memory type")?;
+            // SHADER_DEVICE_ADDRESS usage on the buffer REQUIRES the memory
+            // to be allocated with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+            // (VUID-vkBindBufferMemory-bufferDeviceAddress-03339). Without
+            // it, RADV does not pin a stable device address for the buffer.
+            let mut addr_flags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mt)
+                .push_next(&mut addr_flags);
+            let mem = self
+                .device
+                .allocate_memory(&alloc_info, None)
+                .map_err(|e| e.to_string())?;
+            self.device
+                .bind_buffer_memory(buf, mem, 0)
+                .map_err(|e| e.to_string())?;
+            Ok(Buffer {
+                buf,
+                mem,
+                size,
+                host_visible,
+                sparse: None,
+            })
+        }
+    }
+
+    /// Buffer shared CONCURRENTLY between the main and async queue
+    /// families (M7b-B). No ownership-transfer barriers needed when both
+    /// queues touch it. Falls back to a plain exclusive buffer when there
+    /// is no async family (behavior identical to create_buffer).
+    pub fn create_buffer_shared(&self, size: u64, host_visible: bool) -> Result<Buffer, String> {
+        match self.async_qfam {
+            None => return self.create_buffer(size, host_visible),
+            Some(_) => {}
+        }
+        unsafe {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+            let fams = [self.qfam, self.async_qfam.unwrap()];
+            let buf = self
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        .usage(usage)
+                        .sharing_mode(vk::SharingMode::CONCURRENT)
+                        .queue_family_indices(&fams),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let mt = if host_visible {
+                self.find_mem_type(
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .or_else(|| {
+                    self.find_mem_type(
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                })
+            } else {
+                self.find_mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            }
+            .ok_or("no matching memory type")?;
+            // Same VUID-03339 requirement as create_buffer above.
+            let mut addr_flags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mt)
+                .push_next(&mut addr_flags);
+            let mem = self
+                .device
+                .allocate_memory(&alloc_info, None)
+                .map_err(|e| e.to_string())?;
+            self.device
+                .bind_buffer_memory(buf, mem, 0)
+                .map_err(|e| e.to_string())?;
+            Ok(Buffer {
+                buf,
+                mem,
+                size,
+                host_visible,
+                sparse: None,
+            })
+        }
+    }
+
+    /// Timeline semaphore for M7b-B prefetch ordering (prefetch signals
+    /// value v; the next token's batch waits on v).
+    pub fn create_timeline_semaphore(&self) -> Result<vk::Semaphore, String> {
+        let mut tci = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        unsafe {
+            self.device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut tci),
+                    None,
+                )
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// Batch whose command buffer comes from the async queue family's
+    /// pool. Err if the device has no async family.
+    pub fn create_async_batch(&self, max_sets: u32, max_descriptors: u32) -> Result<Batch, String> {
+        let pool = self.async_cmd_pool.ok_or("no async queue family")?;
+        unsafe {
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(max_descriptors)];
+            let dpool = self
+                .device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(max_sets)
+                        .pool_sizes(&pool_sizes),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let cb = self
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .map_err(|e| e.to_string())?[0];
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| e.to_string())?;
+            Ok(Batch {
+                dpool,
+                cb,
+                fence,
+                recording: false,
+                pending: false,
+            })
+        }
+    }
+
+    /// Host-memory (GTT) buffer: HOST_VISIBLE but explicitly NOT device-local.
+    /// The GPU reads it over PCIe. For oversize weights (expert streaming).
+    pub fn create_buffer_host(&self, size: u64) -> Result<Buffer, String> {
+        unsafe {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST;
+            let buf = self
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(size).usage(usage),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let mt = self
+                .find_mem_type_not(
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+                .ok_or("no host-only memory type")?;
             let mem = self
                 .device
                 .allocate_memory(
@@ -423,23 +777,34 @@ impl Gpu {
                 buf,
                 mem,
                 size,
-                host_visible,
+                host_visible: true,
                 sparse: None,
             })
         }
     }
 
-    /// Host-memory (GTT) buffer: HOST_VISIBLE but explicitly NOT device-local.
-    /// The GPU reads it over PCIe. For oversize weights (expert streaming).
-    pub fn create_buffer_host(&self, size: u64) -> Result<Buffer, String> {
+    /// Host (GTT) buffer shared CONCURRENTLY across queue families —
+    /// the async prefetch gather (family async_qfam) reads expert tensors
+    /// here while the main queue computes. Falls back to a plain
+    /// create_buffer_host when there is no async family.
+    pub fn create_buffer_host_shared(&self, size: u64) -> Result<Buffer, String> {
+        match self.async_qfam {
+            None => return self.create_buffer_host(size),
+            Some(_) => {}
+        }
         unsafe {
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST;
+            let fams = [self.qfam, self.async_qfam.unwrap()];
             let buf = self
                 .device
                 .create_buffer(
-                    &vk::BufferCreateInfo::default().size(size).usage(usage),
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        .usage(usage)
+                        .sharing_mode(vk::SharingMode::CONCURRENT)
+                        .queue_family_indices(&fams),
                     None,
                 )
                 .map_err(|e| e.to_string())?;
@@ -668,6 +1033,131 @@ impl Gpu {
             self.device.unmap_memory(b.mem);
         }
         Ok(())
+    }
+
+    /// Upload via a staging buffer: host -> staging (map) -> GPU copy -> dest.
+    /// Avoids mapping the destination buffer's memory (fixes RADV HOST_COHERENT
+    /// cache coherency bug where concurrent-queue reads see stale content
+    /// after host map+unmap of the same buffer).
+    pub fn upload_staged(&self, b: &Buffer, data: &[u8]) -> Result<(), String> {
+        assert!(b.host_visible, "upload targets host-visible buffers");
+        assert!(data.len() as u64 <= b.size);
+        unsafe {
+            // Create staging buffer
+            let staging = self
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(data.len() as u64)
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(staging);
+            let mt = self
+                .find_mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+                .ok_or("no staging memory type")?;
+            let mem = self
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(mt),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            self.device.bind_buffer_memory(staging, mem, 0).map_err(|e| e.to_string())?;
+
+            // Map staging and copy
+            let ptr = self
+                .device
+                .map_memory(mem, 0, data.len() as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| e.to_string())?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+            self.device.unmap_memory(mem);
+
+            // Copy staging -> dest
+            let cb = self
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .map_err(|e| e.to_string())?[0];
+            self.device
+                .begin_command_buffer(
+                    cb,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| e.to_string())?;
+            self.device.cmd_copy_buffer(
+                cb,
+                staging,
+                b.buf,
+                &[vk::BufferCopy::default()
+                    .size(data.len() as u64)
+                    .src_offset(0)
+                    .dst_offset(0)],
+            );
+            self.device.end_command_buffer(cb).map_err(|e| e.to_string())?;
+
+            let cb_array = [cb];
+            let submit = [vk::SubmitInfo::default().command_buffers(&cb_array)];
+            self.device
+                .queue_submit(self.queue, &submit, vk::Fence::null())
+                .map_err(|e| e.to_string())?;
+            self.device.queue_wait_idle(self.queue).map_err(|e| e.to_string())?;
+
+            self.device.free_command_buffers(self.cmd_pool, &cb_array);
+            self.device.destroy_buffer(staging, None);
+            self.device.free_memory(mem, None);
+        }
+        Ok(())
+    }
+
+    /// GPU virtual address of a buffer (debug: overlap detection). Buffer
+    /// must have SHADER_DEVICE_ADDRESS usage.
+    pub fn device_address(&self, b: &Buffer) -> u64 {
+        unsafe {
+            self.device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b.buf))
+        }
+    }
+
+    /// Raw vk::Buffer / vk::DeviceMemory handles (debug: detect two Buffer
+    /// structs backed by the same VkDeviceMemory object).
+    pub fn raw_buffer_handle(&self, b: &Buffer) -> u64 {
+        // ash 0.38 non-dispatchable handles are 64-bit opaque wrappers.
+        unsafe { std::mem::transmute_copy(&b.buf) }
+    }
+    pub fn raw_mem_handle(&self, b: &Buffer) -> u64 {
+        unsafe { std::mem::transmute_copy(&b.mem) }
+    }
+
+    /// (fd, inode, size) of a buffer's device memory — proves whether two
+    /// VkDeviceMemory allocations alias the same physical pages (DMA-buf
+    /// inode comparison). Requires external_memory_fd (always on Linux).
+    pub fn memory_fd_info(&self, b: &Buffer) -> Result<(i32, u64, u64), String> {
+        unsafe {
+            let ext = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+            let fd = ext
+                .get_memory_fd(
+                    &vk::MemoryGetFdInfoKHR::default()
+                        .memory(b.mem)
+                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+                )
+                .map_err(|e| e.to_string())?;
+            let meta = std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .map_err(|e| e.to_string())?;
+            use std::os::unix::fs::MetadataExt as _;
+            let ino = meta.ino();
+            let sz = meta.len();
+            Ok((fd, ino, sz))
+        }
     }
 
     pub fn download(&self, b: &Buffer, out: &mut [u8]) -> Result<(), String> {
@@ -955,6 +1445,7 @@ impl Gpu {
                 cb,
                 fence,
                 recording: false,
+                pending: false,
             })
         }
     }
@@ -964,6 +1455,22 @@ impl Gpu {
             self.device.destroy_fence(b.fence, None);
             self.device.free_command_buffers(self.cmd_pool, &[b.cb]);
             self.device.destroy_descriptor_pool(b.dpool, None);
+        }
+    }
+
+    /// Destroy a batch created by create_async_batch (cb freed to the
+    /// async pool). Waits on any in-flight submit first.
+    pub fn destroy_async_batch(&self, mut b: Batch) {
+        unsafe {
+            if b.pending {
+                let _ = self.device.wait_for_fences(&[b.fence], true, u64::MAX);
+            }
+            self.device.destroy_fence(b.fence, None);
+            if let Some(pool) = self.async_cmd_pool {
+                self.device.free_command_buffers(pool, &[b.cb]);
+            }
+            self.device.destroy_descriptor_pool(b.dpool, None);
+            b.pending = false;
         }
     }
 

@@ -3,21 +3,26 @@
 // (Qwen3-MoE router: norm_topk_prob=true). Single workgroup; n <= 512.
 //
 // Writes FOUR id rows (each up to 16 i32s) in the ids buffer:
-//   ids[0..k]        original expert ids (probe/debug, last_expert_ids)
-//   ids[16..16+k]    hot ids: index into the dense VRAM hot buffer, or
-//                    SKIP (0xFFFFFFFF) when the expert is cold
-//   ids[32..32+k]    cold ids: original id when cold, SKIP when hot
-//   ids[48..48+k]    slot ids: slot index s when cold, SKIP when hot
-//                    (drives the M7b-A arena matvec: slot == arena expert)
-// remap[e] = dense hot index for expert e, or SKIP when not pinned.
-// The patched mul_mat_vec_id_* kernels early-out on SKIP, so the hot and
-// cold dispatches write disjoint slots of the same output buffer.
+//   ids[0..k]     original expert ids (probe/debug, last_expert_ids)
+//   ids[16+s]     hot id: dense hot-buffer index, SKIP when cold
+//   ids[32+s]     arena id: GLOBAL arena slot (layer*k+slot) when the
+//                 expert is cold AND was prefetched (pmap hit), else SKIP
+//   ids[48+s]     gtt id: original expert id when cold AND NOT
+//                 prefetched (arena miss fallback), else SKIP
+// remap[e] = dense hot index for expert e, SKIP when not pinned hot.
+// pmap[e]  = GLOBAL arena slot for expert e if it was prefetched into
+//            the arena this token, SKIP otherwise (M7b-B). Uploaded
+//            host-side from the previous token's routing prediction.
+// Rows 16/32/48 partition every routed expert into exactly one of
+// {hot, arena, gtt}; the patched mul_mat_vec_id_* kernels early-out on
+// SKIP, so the three cold-path dispatches write disjoint output slots.
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform parameter { uint n; uint k; uint renorm; } p;
 layout(binding = 0) readonly buffer L { float logits[]; };
 layout(binding = 1) writeonly buffer W { float weights[]; };
 layout(binding = 2) writeonly buffer I { int ids[]; };
 layout(binding = 3) readonly buffer R { uint remap[]; };
+layout(binding = 4) readonly buffer P { uint pmap[]; };
 
 const uint SKIP = 0xFFFFFFFFu;
 
@@ -46,10 +51,18 @@ void main() {
     }
     for (uint s = 0; s < p.k; ++s) {
         weights[s] = (p.renorm != 0u) ? picked[s] / wsum : picked[s];
+        uint e = uint(pid[s]);
         ids[s] = pid[s];
-        uint h = remap[uint(pid[s])];
-        ids[16 + s] = int(h);
-        ids[32 + s] = (h == SKIP) ? pid[s] : int(SKIP);
-        ids[48 + s] = (h == SKIP) ? int(s) : int(SKIP);
+        uint h = remap[e];
+        if (h != SKIP) {
+            ids[16 + s] = int(h);
+            ids[32 + s] = int(SKIP);
+            ids[48 + s] = int(SKIP);
+        } else {
+            uint a = pmap[e];
+            ids[16 + s] = int(SKIP);
+            ids[32 + s] = (a != SKIP) ? int(a) : int(SKIP);
+            ids[48 + s] = (a != SKIP) ? int(SKIP) : pid[s];
+        }
     }
 }

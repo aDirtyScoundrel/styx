@@ -1,28 +1,31 @@
 #version 450
-// M7b-A: gather cold expert slabs from GTT into three VRAM scratch arenas.
+// M7b-B async prefetch gather (also used by the in-batch M7b-A path).
+// One workgroup per arena slot s (0..k). The ids row bound here is the
+// layer's prediction/cold row (k i32s):
+//   SKIP            -> nothing gathered for this slot (early out)
+//   expert id e     -> gather e's slab into arena slot (layer*k + s)
 //
-// Dispatch: (k, 1, 1) — one workgroup per cold slot s. Slot s reads the
-// cold id row (bound at the layer's row-3 offset); SKIP means the expert
-// is hot and this slot's arena region is left stale (the cold matvec
-// early-outs on SKIP for the same slot, so stale bytes are never read).
-//
-// Arena layout (three buffers, one per FFN tensor): arena_gate holds k
-// contiguous gate slabs, slot s at s*vg uvec4s; likewise up/down. Slot
-// order == cold id slot order, so the cold matvec_id dispatch binds the
-// matching arena as its A buffer and drives it with the SLOT id row
-// (ids[48..]): slot index == arena expert id, no remap needed.
+// Arena layout (three buffers, one per FFN tensor): n_layers*k contiguous
+// slots, each MAX_SLAB-sized (mixed-quant layers vary slab bytes, so the
+// arena strides by the per-tensor max; dst_vg/dst_vu/dst_vd). The SOURCE
+// tensor uses the layer's own slab size (src_vg/src_vu/src_vd). The cold
+// matvec binds the arena with batch_stride_a = dst slab (elements) and
+// drives it with GLOBAL slot ids (layer*k+s) so the kernel's a_offset
+// lands in this layer's region.
 //
 // Measured on NAVI31: coalesced GTT->VRAM gather = 25-28 GB/s
-// (probes/gtt-gather-probe) vs ~5.8 GiB/s for in-place matvec reads.
+// (probes/gtt-gather-probe); overlaps busy compute on another family.
 layout(local_size_x = 256) in;
 layout(push_constant) uniform P {
-    uint vg;        // gate slab uvec4 count
-    uint vu;        // up slab uvec4 count
-    uint vd;        // down slab uvec4 count
-    uint base_g;    // gate tensor base in gate[], uvec4s
-    uint base_up;   // up tensor base in up[], uvec4s
-    uint base_d;    // down tensor base in down[], uvec4s
-    uint _pad;
+    uint dst_vg;    // arena gate slab uvec4 count (MAX across layers)
+    uint dst_vu;    // arena up slab uvec4 count
+    uint dst_vd;    // arena down slab uvec4 count
+    uint src_vg;    // source gate slab uvec4 count (THIS layer)
+    uint src_vu;    // source up slab uvec4 count
+    uint src_vd;    // source down slab uvec4 count
+    uint layer;     // layer index (selects arena region + ids row)
+    uint k;         // slots per layer
+    uint canary;    // MOE_PF_CANARY: read sources, write canary constants
 } p;
 layout(binding = 0) readonly buffer Gate { uvec4 gate[]; };
 layout(binding = 1) readonly buffer Up { uvec4 up[]; };
@@ -38,16 +41,46 @@ void main() {
     uint s = gl_WorkGroupID.x;
     uint e = uint(ids[s]);
     if (e == SKIP) return;
-    uint gsrc = p.base_g + e * p.vg;
-    uint gdst = s * p.vg;
-    for (uint i = gl_LocalInvocationID.x; i < p.vg; i += 256u)
+    uint slot = p.layer * p.k + s;
+    // MOE_PF_CANARY: write a distinctive constant instead of the gathered
+    // slab, so we can see whether gather WRITES land in an unrelated buffer.
+    if (p.canary != 0u) {
+        // Read the source tensors (like the real gather) but write canary
+        // constants. Isolates "source READ" from "arena WRITE" as the trigger.
+        uint gsrc = e * p.src_vg;
+        uint usrc = e * p.src_vu;
+        uint dsrc = e * p.src_vd;
+        uvec4 acc = uvec4(0);
+        for (uint i = gl_LocalInvocationID.x; i < p.src_vg; i += 256u)
+            acc += gate[gsrc + i];
+        for (uint i = gl_LocalInvocationID.x; i < p.src_vu; i += 256u)
+            acc += up[usrc + i];
+        for (uint i = gl_LocalInvocationID.x; i < p.src_vd; i += 256u)
+            acc += down[dsrc + i];
+        uvec4 cg = uvec4(0x5A5A5A5Au, 0xA5A5A5A5u, acc.x, slot);
+        uvec4 cu = uvec4(0x5A5A5A5Au, 0xA5A5A5A5u, acc.y, slot);
+        uvec4 cd = uvec4(0x5A5A5A5Au, 0xA5A5A5A5u, acc.z, slot);
+        uint gdst = slot * p.dst_vg;
+        uint udst = slot * p.dst_vu;
+        uint ddst = slot * p.dst_vd;
+        for (uint i = gl_LocalInvocationID.x; i < p.dst_vg; i += 256u)
+            arena_g[gdst + i] = cg;
+        for (uint i = gl_LocalInvocationID.x; i < p.dst_vu; i += 256u)
+            arena_u[udst + i] = cu;
+        for (uint i = gl_LocalInvocationID.x; i < p.dst_vd; i += 256u)
+            arena_d[ddst + i] = cd;
+        return;
+    }
+    uint gsrc = e * p.src_vg;
+    uint gdst = slot * p.dst_vg;
+    for (uint i = gl_LocalInvocationID.x; i < p.src_vg; i += 256u)
         arena_g[gdst + i] = gate[gsrc + i];
-    uint usrc = p.base_up + e * p.vu;
-    uint udst = s * p.vu;
-    for (uint i = gl_LocalInvocationID.x; i < p.vu; i += 256u)
+    uint usrc = e * p.src_vu;
+    uint udst = slot * p.dst_vu;
+    for (uint i = gl_LocalInvocationID.x; i < p.src_vu; i += 256u)
         arena_u[udst + i] = up[usrc + i];
-    uint dsrc = p.base_d + e * p.vd;
-    uint ddst = s * p.vd;
-    for (uint i = gl_LocalInvocationID.x; i < p.vd; i += 256u)
+    uint dsrc = e * p.src_vd;
+    uint ddst = slot * p.dst_vd;
+    for (uint i = gl_LocalInvocationID.x; i < p.src_vd; i += 256u)
         arena_d[ddst + i] = down[dsrc + i];
 }

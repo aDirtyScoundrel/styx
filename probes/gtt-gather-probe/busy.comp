@@ -1,0 +1,13 @@
+#version 450
+// M7b-B probe kernel: busy-work on queue 0 (compute) while queue 1 gathers.
+// Reads a VRAM buffer repeatedly to keep the compute units occupied.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P { uint iters; uint n; } p;
+layout(binding = 0) buffer D { uint data[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    uint v = data[i];
+    for (uint t = 0; t < p.iters; t++) v = v * 1103515245u + 12345u;
+    data[i] = v;
+}
