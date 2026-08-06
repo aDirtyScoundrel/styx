@@ -115,6 +115,7 @@ auto expert budget: 21768 MiB (device VRAM 24.0 GiB - 1024 MiB headroom
 | `MOE_EXPERT_HIST=hist.csv` | Popularity pinning: CSV of `layer,expert,hits` from a trace; hottest slabs get VRAM first within the budget. |
 | `MOE_REPIN_INTERVAL=N` | Online repinning every N tokens (0 = off). Best on long generations; break-even ~512 tokens. Pair with `MOE_REPIN_MAX=2`. |
 | `MOE_ARENA=0/1` | Force the M7b-A gather arenas off/on (default: auto, on only for pure system-memory placement). |
+| `MOE_PREFETCH=1` | Opt into the M7b-B async prefetch (default: OFF — known-wrong, see Roadmap). Debug/benchmark only. |
 | `MOE_HUD=1` | Telemetry: hot/cold hit rates, estimated PCIe traffic, per-layer cold heatmap. ~0.5% overhead. |
 
 Example — 6 GiB pinning with telemetry:
@@ -168,7 +169,11 @@ Requires a Vulkan GPU and the reference GGUF (override with
 
 - **M7b-B** — hide the gather behind compute: family-1 async queue +
   timeline semaphores so cold-slab transfers overlap layer compute. The
-  remaining lever for pinned placements.
+  remaining lever for pinned placements. **Status: implemented but PARKED**
+  (off by default, `MOE_PREFETCH=1` opts in). The path corrupts topk writes
+  to cold layers (bids revert to init state); every cheap hypothesis is
+  ruled out — see the vault handoff note. Needs driver-level debugging
+  before it can ship.
 - **M8a/b/c** — architecture generalization for the 80B target: metadata
   dispatch table, fused-QKV split at load, shared experts, router variants.
 - **M9** — hybrid SSM/linear-attention layers (Qwen3-Next uses them in
