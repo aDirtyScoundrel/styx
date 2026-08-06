@@ -39,6 +39,54 @@ fn quant_k(t: u32) -> usize {
     }
 }
 
+/// Read-only mmap of a file. Pages are demand-paged by the kernel, so the
+/// RSS cost is only the pages actually touched — the GGUF header/tensors
+/// we read — rather than the whole file up front. This is the M7c step-1
+/// refactor: same `&[u8]` view as before, but the backing store is the file
+/// itself (page cache), which lets a future disk tier read slabs on demand
+/// without a whole-file heap copy.
+struct MmapFile {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl MmapFile {
+    fn open(path: &Path) -> Result<Self, String> {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
+        let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
+        if len == 0 {
+            return Err(format!("{path:?} is empty"));
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(format!("mmap {path:?}: {}", std::io::Error::last_os_error()));
+        }
+        // File handle may be dropped; the mapping keeps the pages alive.
+        Ok(Self { ptr: ptr as *const u8, len })
+    }
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for MmapFile {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
+
 struct GpuMat {
     buf: Buffer,
     nrows: usize,
@@ -340,8 +388,11 @@ impl MoeModel {
 
         let tmap: HashMap<String, _> = g.tensors.iter().map(|t| (t.name.clone(), t)).collect();
         let n_vocab = tmap["token_embd.weight"].dims[1] as usize;
-        let raw = std::fs::read(path).map_err(|e| e.to_string())?;
-        let data = &raw[g.data_start as usize..];
+        // M7c step 1: mmap instead of fs::read. Same &[u8] tensor view, but
+        // the backing store is the file's page cache — no whole-file heap
+        // copy, and pages are demand-paged as tensors upload.
+        let mapped = MmapFile::open(path)?;
+        let data = &mapped.as_slice()[g.data_start as usize..];
         let bytes = |name: &str| -> &[u8] {
             let t = &tmap[name];
             &data[t.offset as usize..(t.offset + t.size_bytes) as usize]

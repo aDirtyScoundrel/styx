@@ -7,3 +7,4 @@ edition = "2024"
 gguf-rs = { path = "../gguf-rs" }
 vk-backend = { path = "../vk-backend" }
 half = "2"
+libc = "0.2"
