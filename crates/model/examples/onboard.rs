@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 
 /// Engine capability table. Update alongside the loader.
-const SUPPORTED_ARCHS: &[&str] = &["qwen3moe"];
+const SUPPORTED_ARCHS: &[&str] = &["qwen3moe", "qwen3next"];
 /// ggml_type ids the expert matvec pipelines cover (q4_K=12 q5_K=13 q6_K=14 q8_0=8).
 const SUPPORTED_EXPERT_QUANTS: &[u32] = &[8, 12, 13, 14];
 /// token_embd types the host dequant covers (q4_K only, see dequant_q4k).
@@ -27,22 +27,6 @@ const MAX_TOPK: usize = 16;
 /// Tensor-name fragments the engine does NOT implement, with the milestone
 /// that would unblock each. Checked as substrings of per-block tensor names.
 const UNSUPPORTED_TENSORS: &[(&str, &str, &str)] = &[
-    (
-        "ffn_gate_shexp",
-        "shared experts (always-on dense FFN)",
-        "M8c",
-    ),
-    (
-        "ffn_up_shexp",
-        "shared experts (always-on dense FFN)",
-        "M8c",
-    ),
-    (
-        "ffn_down_shexp",
-        "shared experts (always-on dense FFN)",
-        "M8c",
-    ),
-    ("ffn_gate_inp_shexp", "shared-expert router gate", "M8c"),
     (
         "exp_probs_b",
         "router expert bias (DeepSeek-style scoring)",
@@ -58,12 +42,20 @@ const UNSUPPORTED_TENSORS: &[(&str, &str, &str)] = &[
     (
         "ssm_",
         "hybrid SSM / linear-attention layers",
-        "M9 (hybrid)",
+        "M9b (hybrid forward; M9a loads these)",
     ),
     ("shortconv", "short-conv layers", "M9 (hybrid)"),
     ("linear_attn", "linear attention layers", "M9 (hybrid)"),
-    ("attn_qkv", "fused QKV projection", "M8a (split at load)"),
-    ("attn_gate", "gated attention output", "M8b"),
+    (
+        "attn_qkv",
+        "fused QKV projection",
+        "M9b (hybrid forward; M9a loads these)",
+    ),
+    (
+        "attn_gate",
+        "gated attention output",
+        "M9b (hybrid forward; M9a loads these)",
+    ),
     (
         "ffn_gate_up_exps",
         "fused gate+up expert tensor",
@@ -73,11 +65,6 @@ const UNSUPPORTED_TENSORS: &[(&str, &str, &str)] = &[
     (
         "post_ffw_norm",
         "extra pre/post FFN norms (gemma-style)",
-        "M8b",
-    ),
-    (
-        "post_attention_norm",
-        "post-attention norm (gemma-style)",
         "M8b",
     ),
 ];

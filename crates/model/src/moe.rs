@@ -114,10 +114,12 @@ struct Layer {
     k_bias: Option<Buffer>,
     v_bias: Option<Buffer>,
     ffn_norm: Buffer,
-    wq: GpuMat,
-    wk: GpuMat,
-    wv: GpuMat,
-    wo: GpuMat,
+    // Full-attention projections. None on recurrent (linear-attention)
+    // layers of hybrid archs — those carry `lin` weights instead.
+    wq: Option<GpuMat>,
+    wk: Option<GpuMat>,
+    wv: Option<GpuMat>,
+    wo: Option<GpuMat>,
     router: GpuMat, // f32 (n_expert, n_embd)
     gate_exps: ExpMat,
     up_exps: ExpMat,
@@ -125,6 +127,13 @@ struct Layer {
     // shared expert branch (qwen2moe): dense mats, always resident in VRAM,
     // plus the scalar sigmoid gate row (ffn_gate_inp_shexp, n_embd f32).
     shexp: Option<Shexp>,
+    /// M9: true for linear-attention (gated delta net) layers in hybrid
+    /// archs; false for full-attention layers and all non-hybrid archs.
+    /// Full-attn layers keep the paged KV cache; recurrent layers use the
+    /// O(1)-state buffers inside `lin` instead.
+    is_recr: bool,
+    /// M9: linear-attention weights + recurrent state (Some iff is_recr).
+    lin: Option<LinearLayer>,
     remap: Buffer,          // n_expert u32: expert -> dense hot idx, or SKIP (u32::MAX)
     hot_mask: Vec<bool>,    // host copy: expert -> pinned in VRAM?
     remap_vec: Vec<u32>,    // host copy of remap
@@ -141,11 +150,76 @@ struct Shexp {
     down: GpuMat,
 }
 
+/// M9: linear-attention (gated delta net) branch of a hybrid layer —
+/// present iff `Layer.is_recr`. All buffers loaded in M9a; the forward
+/// pass (M9b) and recurrent-state updates (M9c) consume them. Ground truth:
+/// vendor/llama.cpp/src/models/qwen3next.cpp build_layer_attn_linear.
+///
+/// Decode shapes (80B: conv_dim=8192, value_dim=4096, n_v=32, n_k=16):
+///   wqkv [n_embd, conv_dim]     matvec -> qkv_mixed (conv input)
+///   wqkv_gate [n_embd, value_dim] matvec -> z (gated-norm gate)
+///   wba [n_embd, 2*n_v]         matvec -> [beta | alpha] rows, interleaved
+///                                 per k-head group (v/k=2)
+///   conv1d [4, conv_dim] f32    depthwise kernel over last-4 conv_state
+///   dt_bias [n_v], a_log [n_v]  gate g = softplus(alpha+dt_bias) * a_log
+///   norm [head_v_dim]           RMS weights for the gated output norm
+///   wout [value_dim, n_embd]    final projection back to residual width
+struct LinearLayer {
+    wqkv: GpuMat,
+    wqkv_gate: GpuMat,
+    wba: GpuMat,
+    conv1d: Buffer, // f32, 4*conv_dim
+    dt_bias: Buffer, // f32, n_v
+    a_log: Buffer,   // f32, n_v (ssm_a: log-space decay, multiplied post-softplus)
+    norm: Buffer,    // f32, head_v_dim
+    wout: GpuMat,
+    /// M9c recurrent state (allocated zeroed in M9a, updated in-place each
+    /// token once M9c lands):
+    ///   conv_state: conv_dim * (kernel-1) f32 ring of recent qkv_mixed
+    ///   ssm_state:  n_v * head_v_dim * head_v_dim f32 recurrent matrix
+    conv_state: Buffer,
+    ssm_state: Buffer,
+}
+
 pub struct MoeHParams {
     pub base: HParams,
     pub n_expert: usize,
     pub n_expert_used: usize,
     pub n_ff_exp: usize,
+}
+
+/// M9 hybrid (linear-attention) geometry, resolved at load. All zeros for
+/// non-hybrid archs. conv_dim = 2*key_dim + value_dim (conv input width);
+/// value_dim = ssm.inner_size = n_v * head_v_dim.
+pub struct HybridCfg {
+    pub hybrid: bool,
+    pub full_attn_interval: usize,
+    pub conv_dim: usize,
+    pub value_dim: usize,
+    pub n_k_heads: usize,
+    pub n_v_heads: usize,
+    pub head_v_dim: usize,
+    pub rope_dim: Option<usize>,
+}
+
+/// Load-time census returned by `hybrid_summary()` (load_check example).
+pub struct HybridSummary {
+    pub arch: &'static str,
+    pub n_layers: usize,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub hybrid: bool,
+    pub full_attn_interval: usize,
+    pub n_attn: usize,
+    pub n_recr: usize,
+    pub conv_dim: usize,
+    pub value_dim: usize,
+    pub n_k_heads: usize,
+    pub n_v_heads: usize,
+    pub head_v_dim: usize,
+    pub conv_state_bytes: usize,
+    pub ssm_state_bytes: usize,
+    pub attn_layers: Vec<usize>,
 }
 
 /// How Q/K are normalized after their projections.
@@ -169,6 +243,21 @@ pub struct ArchCfg {
     pub norm_topk: bool,
     /// Always-on shared expert branch (ffn_*_shexp + sigmoid gate).
     pub shexp: bool,
+    /// M9 hybrid: model mixes full-attention layers with linear-attention
+    /// (gated delta net) layers. When true, layers where
+    /// `(l + 1) % full_attn_interval != 0` are recurrent (llama.cpp
+    /// is_recr, dense_first=false convention); every `full_attn_interval`th
+    /// layer (l % interval == interval-1) is full attention.
+    pub hybrid: bool,
+    /// Full-attention period for hybrid archs (qwen3next: 4). 0 if !hybrid.
+    pub full_attn_interval: usize,
+    /// Full-attn layers gate the attention output: out = sigmoid(gate)*attn
+    /// before wo. gate comes from the same attn_q matvec (interleaved
+    /// [q, gate] per head). qwen3next: true.
+    pub attn_output_gate: bool,
+    /// RoPE rotates only the first n_rot dims of each head (rope
+    /// .dimension_count metadata); None = full head_dim (existing archs).
+    pub rope_dim: Option<usize>,
 }
 
 impl ArchCfg {
@@ -180,6 +269,10 @@ impl ArchCfg {
                 attn_bias: false,
                 norm_topk: true,
                 shexp: false,
+                hybrid: false,
+                full_attn_interval: 0,
+                attn_output_gate: false,
+                rope_dim: None,
             },
             "olmoe" => ArchCfg {
                 name: "olmoe",
@@ -187,6 +280,10 @@ impl ArchCfg {
                 attn_bias: false,
                 norm_topk: false,
                 shexp: false,
+                hybrid: false,
+                full_attn_interval: 0,
+                attn_output_gate: false,
+                rope_dim: None,
             },
             "qwen2moe" => ArchCfg {
                 name: "qwen2moe",
@@ -194,6 +291,21 @@ impl ArchCfg {
                 attn_bias: true,
                 norm_topk: false,
                 shexp: true,
+                hybrid: false,
+                full_attn_interval: 0,
+                attn_output_gate: false,
+                rope_dim: None,
+            },
+            "qwen3next" => ArchCfg {
+                name: "qwen3next",
+                qk_norm: QkNorm::PerHead,
+                attn_bias: false,
+                norm_topk: true,
+                shexp: true,
+                hybrid: true,
+                full_attn_interval: 4,
+                attn_output_gate: true,
+                rope_dim: None, // filled from rope.dimension_count in load()
             },
             other => return Err(format!("unsupported architecture '{other}'")),
         })
@@ -256,6 +368,8 @@ pub struct MoeModel {
     /// Bytes of expert weights (gate+up+down) per (layer,expert) slab —
     /// the PCIe cost of one cold expert hit.
     pub slab_bytes: u64,
+    /// M9 hybrid geometry (zeroed for non-hybrid archs).
+    pub hybrid: HybridCfg,
     /// Online repinning: every N tokens swap the coldest resident experts
     /// for the hottest non-resident ones (MOE_REPIN_INTERVAL; 0/unset off).
     repin_interval: usize,
@@ -359,7 +473,14 @@ impl MoeModel {
             other => return Err(format!("missing general.architecture: {other:?}")),
         };
         let cfg = ArchCfg::resolve(&arch)?;
+        let mut cfg = cfg;
         let pfx = cfg.name;
+        // Partial RoPE (qwen3next rotates only rope.dimension_count of the
+        // 256 head dims). M9a records it; M9b must assert it is honored.
+        cfg.rope_dim = match g.metadata.get(&format!("{pfx}.rope.dimension_count")) {
+            Some(gguf_rs::Value::U32(v)) => Some(*v as usize),
+            _ => None,
+        };
         let n_layers = get_u32(&format!("{pfx}.block_count")) as usize;
         let n_embd = get_u32(&format!("{pfx}.embedding_length")) as usize;
         let n_heads = get_u32(&format!("{pfx}.attention.head_count")) as usize;
@@ -426,11 +547,13 @@ impl MoeModel {
             .into()
         };
 
-        // Pipelines for every quant type present.
+        // Pipelines for every quant type present in MATRIX tensors. 1-D
+        // tensors (norms, biases, scalar gates — incl. bf16 gate_inp_shexp)
+        // are converted host-side and never flow through a matvec kernel.
         let mut types: Vec<u32> = g
             .tensors
             .iter()
-            .filter(|t| t.ggml_type != 0)
+            .filter(|t| t.ggml_type != 0 && t.dims.len() >= 2)
             .map(|t| t.ggml_type)
             .collect();
         types.sort();
@@ -512,8 +635,14 @@ impl MoeModel {
             .filter(|t| !t.name.contains("_exps."))
             .map(|t| t.size_bytes)
             .sum();
-        //   KV at full context: 2 caches x n_layers x n_ctx x kv_dim f32
-        let kv_max_bytes = (n_layers * 2 * n_ctx_max * n_kv_heads * head_dim * 4) as u64;
+        //   KV at full context: 2 caches x n_attn_layers x n_ctx x kv_dim f32.
+        //   Hybrid archs only cache KV on full-attention layers.
+        let kv_layers = if cfg.hybrid {
+            n_layers / cfg.full_attn_interval
+        } else {
+            n_layers
+        };
+        let kv_max_bytes = (kv_layers * 2 * n_ctx_max * n_kv_heads * head_dim * 4) as u64;
         //   Arena (M7b-B): n_layers x k slots, each padded to the per-tensor
         //   MAX slab across layers (allocated iff any expert spills to GTT;
         //   reserved here because auto usually spills).
@@ -688,11 +817,53 @@ impl MoeModel {
             gpu.upload(&b, as_bytes(&v))?;
             Ok(b)
         };
+        // Like upload_f32 but tolerates f16 source tensors (qwen3next stores
+        // ffn_gate_inp_shexp as f16) and upconverts to f32 on the host.
+        let upload_f32_any = |name: &str| -> Result<Buffer, String> {
+            let t = &tmap[name];
+            let v: Vec<f32> = match t.ggml_type {
+                0 => bytes(name)
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+                1 => bytes(name)
+                    .chunks_exact(2)
+                    .map(|c| half::f16::from_bits(u16::from_le_bytes(c.try_into().unwrap())).to_f32())
+                    .collect(),
+                // bf16 (qwen3next ffn_gate_inp_shexp)
+                30 => bytes(name)
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_bits(u16::from_le_bytes(c.try_into().unwrap())).to_f32())
+                    .collect(),
+                ty => panic!("{name} not f32/f16/bf16 (ggml_type {ty})"),
+            };
+            let b = gpu.create_buffer((v.len() * 4) as u64, true)?;
+            gpu.upload(&b, as_bytes(&v))?;
+            Ok(b)
+        };
 
         let kv_dim = n_kv_heads * head_dim;
+        // M9 ssm hyperparameters (qwen3next; zero for non-hybrid archs).
+        // head_k_dim == head_v_dim == ssm.state_size; n_k = ssm.group_count;
+        // n_v = ssm.time_step_rank. conv_dim = 2*key_dim + value_dim.
+        let (conv_dim, value_dim, n_k_heads, n_v_heads, head_v_dim) = if cfg.hybrid {
+            let hk = get_u32(&format!("{pfx}.ssm.state_size")) as usize;
+            let nk = get_u32(&format!("{pfx}.ssm.group_count")) as usize;
+            let nv = get_u32(&format!("{pfx}.ssm.time_step_rank")) as usize;
+            let inner = get_u32(&format!("{pfx}.ssm.inner_size")) as usize;
+            assert_eq!(inner / nv, hk, "head_v_dim != ssm.state_size");
+            (2 * hk * nk + inner, inner, nk, nv, hk)
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        // Capture before `cfg` moves into the model struct below.
+        let rope_dim = cfg.rope_dim;
         let mut layers = Vec::new();
         for l in 0..n_layers {
             let n = |s: &str| format!("blk.{l}.{s}.weight");
+            // M9: layer kind. dense_first=false convention (llama.cpp
+            // is_recr): layer l is recurrent unless (l+1) % interval == 0.
+            let is_recr = cfg.hybrid && (l + 1) % cfg.full_attn_interval != 0;
             // remap[e] = dense hot index or SKIP (0xFFFFFFFF)
             let mut remap_vec = vec![u32::MAX; n_expert];
             if let Some(order) = &hot_order {
@@ -719,9 +890,11 @@ impl MoeModel {
             };
             let q_norm = opt_f32("attn_q_norm.weight")?;
             let k_norm = opt_f32("attn_k_norm.weight")?;
-            match cfg.qk_norm {
-                QkNorm::None => assert!(q_norm.is_none(), "unexpected attn_q_norm"),
-                _ => assert!(q_norm.is_some() && k_norm.is_some(), "missing qk norm"),
+            if !is_recr {
+                match cfg.qk_norm {
+                    QkNorm::None => assert!(q_norm.is_none(), "unexpected attn_q_norm"),
+                    _ => assert!(q_norm.is_some() && k_norm.is_some(), "missing qk norm"),
+                }
             }
             let q_bias = opt_f32("attn_q.bias")?;
             let k_bias = opt_f32("attn_k.bias")?;
@@ -729,13 +902,45 @@ impl MoeModel {
             assert_eq!(cfg.attn_bias, q_bias.is_some(), "attn bias mismatch");
             let shexp = if cfg.shexp {
                 Some(Shexp {
-                    gate_inp: upload_f32(&n("ffn_gate_inp_shexp"))?,
+                    // f16 on qwen3next, f32 on qwen2moe — upconvert either.
+                    gate_inp: upload_f32_any(&n("ffn_gate_inp_shexp"))?,
                     gate: upload_mat(&n("ffn_gate_shexp"))?,
                     up: upload_mat(&n("ffn_up_shexp"))?,
                     down: upload_mat(&n("ffn_down_shexp"))?,
                 })
             } else {
                 None
+            };
+            // M9 linear-attention branch: weights + zeroed recurrent state.
+            let lin = if is_recr {
+                let conv_state = gpu.create_buffer((conv_dim * 3 * 4) as u64, true)?;
+                gpu.upload(&conv_state, &vec![0u8; conv_dim * 3 * 4])?;
+                let ssm_state =
+                    gpu.create_buffer((n_v_heads * head_v_dim * head_v_dim * 4) as u64, true)?;
+                gpu.upload(
+                    &ssm_state,
+                    &vec![0u8; n_v_heads * head_v_dim * head_v_dim * 4],
+                )?;
+                Some(LinearLayer {
+                    wqkv: upload_mat(&n("attn_qkv"))?,
+                    wqkv_gate: upload_mat(&n("attn_gate"))?,
+                    wba: upload_mat(&n("ssm_ba"))?,
+                    conv1d: upload_f32(&format!("blk.{l}.ssm_conv1d.weight"))?,
+                    dt_bias: upload_f32(&format!("blk.{l}.ssm_dt.bias"))?,
+                    a_log: upload_f32(&format!("blk.{l}.ssm_a"))?,
+                    norm: upload_f32(&format!("blk.{l}.ssm_norm.weight"))?,
+                    wout: upload_mat(&n("ssm_out"))?,
+                    conv_state,
+                    ssm_state,
+                })
+            } else {
+                None
+            };
+            // qwen3next names its pre-FFN norm post_attention_norm.
+            let ffn_norm_name = if tmap.contains_key(&format!("blk.{l}.ffn_norm.weight")) {
+                "ffn_norm"
+            } else {
+                "post_attention_norm"
             };
             layers.push(Layer {
                 attn_norm: upload_f32(&n("attn_norm"))?,
@@ -744,23 +949,27 @@ impl MoeModel {
                 q_bias,
                 k_bias,
                 v_bias,
-                ffn_norm: upload_f32(&n("ffn_norm"))?,
-                wq: upload_mat(&n("attn_q"))?,
-                wk: upload_mat(&n("attn_k"))?,
-                wv: upload_mat(&n("attn_v"))?,
-                wo: upload_mat(&n("attn_output"))?,
+                ffn_norm: upload_f32(&n(ffn_norm_name))?,
+                wq: (!is_recr).then(|| upload_mat(&n("attn_q"))).transpose()?,
+                wk: (!is_recr).then(|| upload_mat(&n("attn_k"))).transpose()?,
+                wv: (!is_recr).then(|| upload_mat(&n("attn_v"))).transpose()?,
+                wo: (!is_recr)
+                    .then(|| upload_mat(&n("attn_output")))
+                    .transpose()?,
                 router: upload_f32_mat(&n("ffn_gate_inp"))?,
                 gate_exps: upload_exp(&n("ffn_gate_exps"), l)?,
                 up_exps: upload_exp(&n("ffn_up_exps"), l)?,
                 down_exps: upload_exp(&n("ffn_down_exps"), l)?,
                 shexp,
+                is_recr,
+                lin,
                 remap,
                 hot_mask,
                 remap_vec,
                 slot_experts,
                 hits: vec![0u64; n_expert],
-                // Paged KV: start with one page, grown on demand in
-                // forward_token (copy-on-grow at page boundaries).
+                // Paged KV: one page to start, grown on demand (full-attn
+                // layers only; recurrent layers keep these 1-page dummies).
                 kcache: gpu.create_buffer((KV_PAGE_TOKENS * kv_dim * 4) as u64, true)?,
                 vtcache: gpu.create_buffer((KV_PAGE_TOKENS * kv_dim * 4) as u64, true)?,
             });
@@ -930,6 +1139,18 @@ impl MoeModel {
 
         let batch = Some(gpu.create_batch(8192, 49152)?);
 
+        // Build before the struct literal moves `cfg`.
+        let hybrid_cfg = HybridCfg {
+            hybrid: cfg.hybrid,
+            full_attn_interval: cfg.full_attn_interval,
+            conv_dim,
+            value_dim,
+            n_k_heads,
+            n_v_heads,
+            head_v_dim,
+            rope_dim,
+        };
+
         Ok(MoeModel {
             hp: MoeHParams {
                 base: HParams {
@@ -1020,11 +1241,42 @@ impl MoeModel {
                     t.size_bytes / n_expert as u64
                 })
                 .sum(),
+            hybrid: hybrid_cfg,
         })
     }
 
     pub fn reset(&mut self) {
         self.n_past = 0;
+    }
+
+    /// M9a introspection for the load_check example: layer-kind census and
+    /// hybrid geometry. Cheap (host-side only).
+    pub fn hybrid_summary(&self) -> HybridSummary {
+        let attn_layers: Vec<usize> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, ly)| !ly.is_recr)
+            .map(|(l, _)| l)
+            .collect();
+        HybridSummary {
+            arch: self.cfg.name,
+            n_layers: self.layers.len(),
+            n_expert: self.hp.n_expert,
+            n_expert_used: self.hp.n_expert_used,
+            hybrid: self.hybrid.hybrid,
+            full_attn_interval: self.hybrid.full_attn_interval,
+            n_attn: attn_layers.len(),
+            n_recr: self.layers.len() - attn_layers.len(),
+            conv_dim: self.hybrid.conv_dim,
+            value_dim: self.hybrid.value_dim,
+            n_k_heads: self.hybrid.n_k_heads,
+            n_v_heads: self.hybrid.n_v_heads,
+            head_v_dim: self.hybrid.head_v_dim,
+            conv_state_bytes: self.hybrid.conv_dim * 3 * 4,
+            ssm_state_bytes: self.hybrid.n_v_heads * self.hybrid.head_v_dim * self.hybrid.head_v_dim * 4,
+            attn_layers,
+        }
     }
 
     /// Online repinning: fold the last token's routed experts into per-layer
@@ -1436,9 +1688,28 @@ impl MoeModel {
                 n_embd as u32,
                 1,
             );
-            self.rec_matvec_b(&mut batch, &ly.wq, &self.bnorm, &self.bq, false);
-            self.rec_matvec_b(&mut batch, &ly.wk, &self.bnorm, &self.bk, false);
-            self.rec_matvec_b(&mut batch, &ly.wv, &self.bnorm, &self.bv, true);
+            self.rec_matvec_b(
+                &mut batch,
+                ly.wq.as_ref()
+                    .expect("M9b: recurrent-layer forward not yet implemented"),
+                &self.bnorm,
+                &self.bq,
+                false,
+            );
+            self.rec_matvec_b(
+                &mut batch,
+                ly.wk.as_ref().expect("M9b: recurrent-layer forward"),
+                &self.bnorm,
+                &self.bk,
+                false,
+            );
+            self.rec_matvec_b(
+                &mut batch,
+                ly.wv.as_ref().expect("M9b: recurrent-layer forward"),
+                &self.bnorm,
+                &self.bv,
+                true,
+            );
             match self.cfg.qk_norm {
                 QkNorm::PerHead => {
                     self.rec_rms(
@@ -1529,7 +1800,13 @@ impl MoeModel {
                     (n_heads as u32, 1, 1),
                 )
                 .unwrap();
-            self.rec_matvec_b(&mut batch, &ly.wo, &self.battn, &self.bproj, true);
+            self.rec_matvec_b(
+                &mut batch,
+                ly.wo.as_ref().expect("M9b: recurrent-layer forward"),
+                &self.battn,
+                &self.bproj,
+                true,
+            );
             self.rec_add(&mut batch, &self.bx, &self.bproj, n_embd as u32);
 
             // --- MoE FFN ---
