@@ -438,13 +438,25 @@ impl Gpu {
             // VK_KHR_external_memory_fd: lets us export a buffer's device
             // memory as a DMA-buf fd so fd-dbg can detect physical-page
             // aliasing between VkDeviceMemory allocations (inode compare).
-            let ext_names = [c"VK_KHR_external_memory_fd".as_ptr()];
+            // VK_EXT_subgroup_size_control: lets pipelines pin
+            // requiredSubgroupSize — needed by the gated_delta_net kernel,
+            // which computes LANES_PER_COLUMN/COLS_PER_WG from the device
+            // subgroup size (64 on RADV). RDNA3's minSubgroupSize is 32, so
+            // without this pin the driver could schedule 32-lane waves and
+            // silently corrupt the column-shard reductions.
+            let ext_names = [
+                c"VK_KHR_external_memory_fd".as_ptr(),
+                c"VK_EXT_subgroup_size_control".as_ptr(),
+            ];
+            let mut f_ssc = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+                .subgroup_size_control(true);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(qcis)
                 .enabled_features(&features)
                 .enabled_extension_names(&ext_names)
                 .push_next(&mut f16i8)
-                .push_next(&mut f11);
+                .push_next(&mut f11)
+                .push_next(&mut f_ssc);
             let device = instance
                 .create_device(pdev, &dci, None)
                 .map_err(|e| e.to_string())?;
@@ -1279,6 +1291,108 @@ impl Gpu {
                 .module(module)
                 .name(c"main")
                 .specialization_info(&spec_info);
+            let ci = [vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(layout)];
+            let pipeline = self
+                .device
+                .create_compute_pipelines(vk::PipelineCache::null(), &ci, None)
+                .map_err(|(_, e)| e.to_string())?[0];
+
+            Ok(Pipeline {
+                pipeline,
+                layout,
+                dset_layout,
+                module,
+                n_bindings,
+            })
+        }
+    }
+
+    /// Like `create_pipeline` but additionally pins `requiredSubgroupSize`
+    /// on the compute shader stage (requires the device to have been created
+    /// with `VK_EXT_subgroup_size_control` + `subgroupSizeControl`). Needed by
+    /// kernels whose spec constants encode the device subgroup size — e.g.
+    /// gated_delta_net, which derives LANES_PER_COLUMN/COLS_PER_WG from it.
+    /// Without the pin, RDNA3 (minSubgroupSize=32) could schedule 32-lane
+    /// waves and silently break the column-shard reductions the kernel assumes.
+    pub fn create_pipeline_subgroup(
+        &self,
+        spv_path: &Path,
+        n_bindings: u32,
+        push_bytes: u32,
+        spec: &[(u32, u32)],
+        required_subgroup_size: u32,
+    ) -> Result<Pipeline, String> {
+        let bytes = std::fs::read(spv_path).map_err(|e| format!("{spv_path:?}: {e}"))?;
+        if bytes.len() % 4 != 0 {
+            return Err("SPIR-V size not multiple of 4".into());
+        }
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        unsafe {
+            let module = self
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+                .map_err(|e| e.to_string())?;
+
+            let bindings: Vec<_> = (0..n_bindings)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect();
+            let dset_layout = self
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+
+            let push = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .size(push_bytes)];
+            let layouts = [dset_layout];
+            let layout = self
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&layouts)
+                        .push_constant_ranges(&push),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+
+            let entries: Vec<_> = spec
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _))| {
+                    vk::SpecializationMapEntry::default()
+                        .constant_id(*id)
+                        .offset(i as u32 * 4)
+                        .size(4)
+                })
+                .collect();
+            let spec_data: Vec<u8> = spec.iter().flat_map(|(_, v)| v.to_le_bytes()).collect();
+            let spec_info = vk::SpecializationInfo::default()
+                .map_entries(&entries)
+                .data(&spec_data);
+
+            let mut req_sg =
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                    .required_subgroup_size(required_subgroup_size);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .specialization_info(&spec_info)
+                .push_next(&mut req_sg);
             let ci = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout)];

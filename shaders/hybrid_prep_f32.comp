@@ -1,0 +1,62 @@
+#version 450
+// M9b hybrid prep (qwen3next linear-attention decode, n_tokens==1).
+// Three jobs, partitioned over gl_GlobalInvocationID.x:
+//   [0, conv_dim)        conv_state ring shift in CHANNEL-MAJOR layout
+//                        [conv_dim, 4] (4 taps contiguous per channel,
+//                        t=0 oldest, t=3 newest). After the shift the state
+//                        buffer IS the ssm_conv input (ggml concat of
+//                        conv_states [conv_dim,3] and qkv_mixed [conv_dim,1],
+//                        ne[0]=4 contiguous). src0_base = c*nb01 + i2 with
+//                        nb01=16 bytes -> taps c*4+{0..3}.
+//   [conv_dim, conv_dim+2*n_v)  split ssm_ba output into beta/alpha rows:
+//                        ba is interleaved per k-head group as [b(2), a(2)]
+//                        x n_k (v/k = 2 for 80B). beta_row[v] = sigmoid(b),
+//                        alpha_row[v] = alpha (raw; gate fuses bias+softplus).
+//   [conv_dim+2*n_v, +3*n_v)  g_row[v] = softplus(alpha_row[v] + dt[v]) * a_log[v]
+// local_size 256.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter {
+    uint conv_dim; // conv channels (qkv_mixed width)
+    uint n_v;      // value heads (ssm.time_step_rank)
+    uint n_k;      // key head groups (ssm.group_count)
+} p;
+layout(binding = 0) readonly  buffer QkvNew { float qkv_new[]; };    // [conv_dim]
+layout(binding = 1) buffer ConvState { float conv_state[]; };        // [conv_dim, 4] channel-major
+layout(binding = 2) readonly  buffer Ba { float ba[]; };             // [2*n_v] interleaved
+layout(binding = 3) buffer Beta { float beta[]; };                   // [n_v]
+layout(binding = 4) buffer Alpha { float alpha[]; };                 // [n_v]
+layout(binding = 5) readonly  buffer Dt { float dt[]; };             // [n_v] ssm_dt bias
+layout(binding = 6) readonly  buffer ALog { float a_log[]; };        // [n_v] ssm_a
+layout(binding = 7) buffer G { float g[]; };                         // [n_v]
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = p.conv_dim + 3 * p.n_v;
+    if (i >= total) return;
+
+    if (i < p.conv_dim) {
+        // channel-major: state[c*4 + t]; t=0 oldest, t=3 newest.
+        float s1 = conv_state[i * 4 + 1];
+        float s2 = conv_state[i * 4 + 2];
+        float s3 = conv_state[i * 4 + 3];
+        conv_state[i * 4 + 0] = s1;
+        conv_state[i * 4 + 1] = s2;
+        conv_state[i * 4 + 2] = s3;
+        conv_state[i * 4 + 3] = qkv_new[i];
+    } else if (i < p.conv_dim + 2 * p.n_v) {
+        uint j = i - p.conv_dim;          // j in [0, 2*n_v)
+        uint g = j / (p.n_v / p.n_k);     // k-head group of output v-head j
+        uint in_group = j % (p.n_v / p.n_k);
+        uint v = g * (p.n_v / p.n_k) + in_group;
+        // source ba layout per group: [b x r, a x r], r = n_v/n_k
+        uint r = p.n_v / p.n_k;
+        float bval = ba[g * 2 * r + in_group];
+        float aval = ba[g * 2 * r + r + in_group];
+        beta[v] = 1.0 / (1.0 + exp(-bval));
+        alpha[v] = aval;
+    } else {
+        uint v = i - p.conv_dim - 2 * p.n_v;
+        float sp = log(1.0 + exp(alpha[v] + dt[v]));
+        g[v] = sp * a_log[v];
+    }
+}

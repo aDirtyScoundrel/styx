@@ -1,0 +1,23 @@
+#version 450
+// M9b full-attention QG split (qwen3next). The attn_q projection emits, per
+// head, [q(head_dim) | gate(head_dim)] interleaved. Split into a contiguous
+// q buffer and a contiguous gate buffer so the existing attention path and a
+// trailing gate multiply can consume them. One workgroup per head.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform parameter {
+    uint n_heads;  // full-attention heads
+    uint head_dim; // q (and gate) width per head
+} p;
+layout(binding = 0) readonly buffer QG { float qg[]; };   // [n_heads, 2*head_dim]
+layout(binding = 1) buffer Q { float q[]; };              // [n_heads, head_dim]
+layout(binding = 2) buffer Gate { float gate[]; };        // [n_heads, head_dim]
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= p.n_heads) return;
+    uint i = gl_LocalInvocationID.x;
+    if (i >= p.head_dim) return;
+    uint src = h * 2 * p.head_dim;
+    q[h * p.head_dim + i] = qg[src + i];
+    gate[h * p.head_dim + i] = qg[src + p.head_dim + i];
+}

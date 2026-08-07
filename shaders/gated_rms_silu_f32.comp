@@ -1,0 +1,36 @@
+#version 450
+// M9b gated output norm (qwen3next build_norm_gated):
+// out[h,i] = rms(core[h,i], w[i], eps) * silu(z[h,i])
+// RMS is per-row over head_v_dim with shared weight row w[head_v_dim].
+// One workgroup of 128 threads per v-head row.
+layout(local_size_x = 128) in;
+layout(push_constant) uniform parameter {
+    uint nrows;  // n_v heads
+    uint stride; // head_v_dim
+    float eps;
+} p;
+layout(binding = 0) readonly buffer Core { float core[]; }; // [n_v, stride]
+layout(binding = 1) readonly buffer W { float w[]; };       // [stride]
+layout(binding = 2) readonly buffer Z { float z[]; };       // [n_v, stride]
+layout(binding = 3) buffer Out { float out_[]; };           // [n_v, stride]
+shared float tmp[128];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= p.nrows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * p.stride;
+    float v = (tid < p.stride) ? core[base + tid] : 0.0;
+    tmp[tid] = v * v;
+    barrier();
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) tmp[tid] += tmp[tid + s];
+        barrier();
+    }
+    float inv = 1.0 / sqrt(tmp[0] / float(p.stride) + p.eps);
+    if (tid < p.stride) {
+        float normed = core[base + tid] * inv * w[tid];
+        float zval = z[base + tid];
+        out_[base + tid] = normed * (zval / (1.0 + exp(-zval)));
+    }
+}

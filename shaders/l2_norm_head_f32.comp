@@ -1,0 +1,35 @@
+#version 450
+// M9b per-head L2 normalize with GQA-style head repeat (qwen3next q/k).
+// Input x is [n_k_heads, stride] (head_k_dim = stride = 128 for 80B).
+// Output y is [n_k_heads * repeat, stride], v-head h maps to k-head h/repeat
+// (repeat = n_v/n_k = 2 for 80B), matching the repeat-interleave ggml does
+// before the GDN scan. This avoids a separate repeat dispatch.
+//
+// Avoids the vendor fastdiv ABI by using a plain shared-mem reduction:
+// workgroup = one row, local_size = stride (128).
+layout(local_size_x = 128) in;
+layout(push_constant) uniform parameter {
+    uint n_k_heads; // number of key heads in x (rows of x)
+    uint repeat;    // v-heads per k-head (n_v/n_k)
+    float eps;
+} p;
+layout(binding = 0) readonly buffer X { float x[]; };   // [n_k_heads, 128]
+layout(binding = 1) buffer Y { float y[]; };            // [n_k_heads*repeat, 128]
+shared float tmp[128];
+
+void main() {
+    uint out_head = gl_WorkGroupID.x;      // v-head id
+    uint src_head = out_head / p.repeat;   // k-head id
+    uint tid = gl_LocalInvocationID.x;
+    uint stride = 128;
+    uint base = src_head * stride;
+    float v = x[base + tid];
+    tmp[tid] = v * v;
+    barrier();
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) tmp[tid] += tmp[tid + s];
+        barrier();
+    }
+    float scale = 1.0 / max(sqrt(tmp[0]), p.eps);
+    y[out_head * stride + tid] = v * scale;
+}

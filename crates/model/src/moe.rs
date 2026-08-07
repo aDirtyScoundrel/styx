@@ -150,6 +150,64 @@ struct Shexp {
     down: GpuMat,
 }
 
+/// M9b: the seven compute pipelines that drive one linear-attention layer
+/// during decode. Created only for hybrid archs. The gated_delta_net
+/// pipeline pins requiredSubgroupSize to the device subgroup size because
+/// its spec constants (SUBGROUP_SIZE/LANES_PER_COLUMN) encode it — see
+/// vk-backend create_pipeline_subgroup for why.
+struct HybridPipelines {
+    prep: Pipeline,           // hybrid_prep_f32
+    ssm_conv_silu: Pipeline,  // vendor ssm_conv_f32, APPLY_SILU=1
+    l2norm_head: Pipeline,    // l2_norm_head_f32 (norm + q/k repeat)
+    gdn: Pipeline,            // vendor gated_delta_net_f32 (clustered)
+    gated_rms_silu: Pipeline, // gated_rms_silu_f32
+    split_qg: Pipeline,       // split_qg_f32 (full-attn Q+gate split)
+    sig_mul: Pipeline,        // sig_mul_f32 (sigmoid-gate multiply)
+}
+
+impl HybridPipelines {
+    fn new(
+        gpu: &Gpu,
+        spv: &impl Fn(&str) -> PathBuf,
+        ours: &impl Fn(&str) -> PathBuf,
+        s_v: u32,
+        subgroup: u32,
+        lanes_per_column: u32,
+    ) -> Result<Self, String> {
+        use std::mem::size_of;
+        use vk_backend::ops::{GdnPush, SsmConvPush};
+        let prep = gpu.create_pipeline(&ours("hybrid_prep_f32"), 8, 12, &[])?;
+        let ssm_conv_silu = gpu.create_pipeline(
+            &spv("ssm_conv_f32"),
+            4,
+            size_of::<SsmConvPush>() as u32,
+            // (BLOCK_SIZE=32, TOKENS_PER_WG=16, APPLY_BIAS=0, APPLY_SILU=1)
+            &[(0, 32), (1, 16), (2, 0), (3, 1)],
+        )?;
+        let l2norm_head = gpu.create_pipeline(&ours("l2_norm_head_f32"), 2, 12, &[])?;
+        // KDA=0 for qwen3next (scalar gate, not per-head KDA).
+        let gdn = gpu.create_pipeline_subgroup(
+            &spv("gated_delta_net_f32"),
+            7,
+            size_of::<GdnPush>() as u32,
+            &[(0, s_v), (1, 0), (2, subgroup), (3, lanes_per_column)],
+            subgroup,
+        )?;
+        let gated_rms_silu = gpu.create_pipeline(&ours("gated_rms_silu_f32"), 4, 12, &[])?;
+        let split_qg = gpu.create_pipeline(&ours("split_qg_f32"), 3, 8, &[])?;
+        let sig_mul = gpu.create_pipeline(&ours("sig_mul_f32"), 3, 4, &[])?;
+        Ok(Self {
+            prep,
+            ssm_conv_silu,
+            l2norm_head,
+            gdn,
+            gated_rms_silu,
+            split_qg,
+            sig_mul,
+        })
+    }
+}
+
 /// M9: linear-attention (gated delta net) branch of a hybrid layer —
 /// present iff `Layer.is_recr`. All buffers loaded in M9a; the forward
 /// pass (M9b) and recurrent-state updates (M9c) consume them. Ground truth:
@@ -329,6 +387,14 @@ pub struct MoeModel {
     p_topk: Pipeline,
     p_reduce: Pipeline,
     p_gather: Pipeline,
+    /// M9b linear-attention pipelines. None on non-hybrid archs.
+    p_hybrid_prep: Option<Pipeline>,   // conv-state shift + ba split + gate/beta
+    p_ssm_conv_silu: Option<Pipeline>, // depthwise conv + silu (APPLY_SILU=1)
+    p_l2norm_head: Option<Pipeline>,   // per-head L2 norm + q/k repeat-interleave
+    p_gdn: Option<Pipeline>,           // gated_delta_net scan (clustered, sg=64)
+    p_gated_rms_silu: Option<Pipeline>,// gated output norm * silu(z)
+    p_split_qg: Option<Pipeline>,      // full-attn Q+gate interleave split
+    p_sig_mul: Option<Pipeline>,       // sigmoid-gate multiply
     layers: Vec<Layer>,
     output_norm: Buffer,
     head: GpuMat,
@@ -343,7 +409,20 @@ pub struct MoeModel {
     bv: Buffer,
     battn: Buffer,
     bproj: Buffer,
-    brouter: Buffer,  // n_expert logits
+        // M9b linear-attention scratch buffers (hybrid archs only).
+        bqkv_mixed: Option<Buffer>,  // qkv_new [conv_dim] for hybrid_prep
+        bq_rep: Option<Buffer>,      // repeated q [value_dim] for l2norm_head
+        bk_rep: Option<Buffer>,      // repeated k [value_dim] for l2norm_head
+        bz: Option<Buffer>,          // z [value_dim] for gated norm
+        bcore: Option<Buffer>,       // core [value_dim] for gated norm input
+        bb: Option<Buffer>,          // beta [n_v]
+        ba: Option<Buffer>,          // alpha [n_v]
+        bgate_lin: Option<Buffer>,   // gate [n_v]
+        balpha: Option<Buffer>,      // alpha_raw [n_v]
+        bdt: Option<Buffer>,         // dt_bias [n_v]
+        balog: Option<Buffer>,       // a_log [n_v]
+        bg: Option<Buffer>,          // g [n_v]
+        brouter: Buffer,  // n_expert logits
     bweights: Buffer, // k f32
     bids: Buffer,     // n_layers x 64B rows; k i32 ids per layer at offset l*64
     bgate: Buffer,    // k * n_ff_exp
@@ -858,6 +937,43 @@ impl MoeModel {
         };
         // Capture before `cfg` moves into the model struct below.
         let rope_dim = cfg.rope_dim;
+        // M9b linear-attention pipelines (hybrid archs only). Spec-constant
+        // ground truth (llama.cpp ggml-vulkan.cpp:5676-5720, RADV subgroup=64,
+        // CLUSTERED_BIT): S_V>=128 && clustered -> lanes_per_column=8,
+        // cols_per_wg=8, need_partial_subgroup_reduce=true -> clustered variant.
+        // requiredSubgroupSize=64 is pinned to keep RDNA3 from scheduling
+        // 32-lane waves that would corrupt the column-shard reductions.
+        let (
+            p_hybrid_prep,
+            p_ssm_conv_silu,
+            p_l2norm_head,
+            p_gdn,
+            p_gated_rms_silu,
+            p_split_qg,
+            p_sig_mul,
+        ) = if cfg.hybrid {
+            let subgroup = 64u32; // RADV RX7900XTX device subgroup size
+            let lanes_per_column = 8u32;
+            let hp = HybridPipelines::new(
+                &gpu,
+                &spv,
+                &ours,
+                head_v_dim as u32,
+                subgroup,
+                lanes_per_column,
+            )?;
+            (
+                Some(hp.prep),
+                Some(hp.ssm_conv_silu),
+                Some(hp.l2norm_head),
+                Some(hp.gdn),
+                Some(hp.gated_rms_silu),
+                Some(hp.split_qg),
+                Some(hp.sig_mul),
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
         let mut layers = Vec::new();
         for l in 0..n_layers {
             let n = |s: &str| format!("blk.{l}.{s}.weight");
@@ -1007,6 +1123,33 @@ impl MoeModel {
         let bv = mk(kv_dim)?;
         let battn = mk(q_dim)?;
         let bproj = mk(n_embd)?;
+        // M9b linear-attention scratch buffers (hybrid archs only).
+        // qkv_mixed [conv_dim] for hybrid_prep, repeated q/k for l2norm_head,
+        // z [value_dim] for gated norm, core [value_dim] for gated norm input.
+        let (bqkv_mixed, bq_rep, bk_rep, bz, bcore, bb, ba, bgate_lin, balpha, bdt, balog, bg) =
+            if cfg.hybrid {
+                let cd = conv_dim;
+                let vd = value_dim;
+                let nv = n_v_heads;
+                let mk_f32 = |n: usize| gpu.create_buffer((n * 4) as u64, true);
+                let mk_i32 = |n: usize| gpu.create_buffer((n * 4) as u64, true);
+                (
+                    Some(mk_f32(cd)?),          // qkv_new
+                    Some(mk_f32(vd)?),          // q_rep
+                    Some(mk_f32(vd)?),          // k_rep
+                    Some(mk_f32(vd)?),          // z
+                    Some(mk_f32(vd)?),          // core
+                    Some(mk_f32(nv)?),          // beta
+                    Some(mk_f32(nv)?),          // alpha
+                    Some(mk_f32(nv)?),          // gate
+                    Some(mk_f32(nv)?),          // alpha_raw
+                    Some(mk_f32(nv)?),          // dt_bias
+                    Some(mk_f32(nv)?),          // a_log
+                    Some(mk_f32(nv)?),          // g
+                )
+            } else {
+                (None, None, None, None, None, None, None, None, None, None, None, None)
+            };
         let brouter = mk(n_expert)?;
         let bweights = mk(k)?;
         // M7b-B: 4 rows x 64 i32 = 256B per layer
@@ -1182,6 +1325,13 @@ impl MoeModel {
             p_topk,
             p_reduce,
             p_gather,
+            p_hybrid_prep,
+            p_ssm_conv_silu,
+            p_l2norm_head,
+            p_gdn,
+            p_gated_rms_silu,
+            p_split_qg,
+            p_sig_mul,
             layers,
             output_norm,
             head,
@@ -1194,6 +1344,18 @@ impl MoeModel {
             bv,
             battn,
             bproj,
+            bqkv_mixed,
+            bq_rep,
+            bk_rep,
+            bz,
+            bcore,
+            bb,
+            ba,
+            bgate_lin,
+            balpha,
+            bdt,
+            balog,
+            bg,
             brouter,
             bweights,
             bids,

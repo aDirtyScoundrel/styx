@@ -452,3 +452,70 @@ impl RopePush {
         }
     }
 }
+
+/// M9 gated_delta_net push constants — byte-identical to
+/// vk_op_gated_delta_net_push_constants (ggml-vulkan.cpp:1750). K=1: dst =
+/// [output (S_v*H*n_tokens) | final state] at s_off. Dispatch (H, n_seqs, S_v).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GdnPush {
+    pub h: u32,
+    pub n_tokens: u32,
+    pub n_seqs: u32,
+    pub s_off: u32,
+    pub sq1: u32,
+    pub sq2: u32,
+    pub sq3: u32,
+    pub sv1: u32,
+    pub sv2: u32,
+    pub sv3: u32,
+    pub sb1: u32,
+    pub sb2: u32,
+    pub sb3: u32,
+    pub neq1: u32,
+    pub rq3: u32,
+    pub scale: f32,
+    pub k: u32,
+}
+
+impl GdnPush {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const _ as *const u8,
+                std::mem::size_of::<GdnPush>(),
+            )
+        }
+    }
+}
+
+/// M9 ssm_conv push constants — byte-identical to
+/// vk_op_ssm_conv_push_constants (ggml-vulkan.cpp:1770). All strides in BYTES
+/// (the shader divides by 4 for f32). Dispatch (ceil(nr/32), ceil(n_t/16), n_s)
+/// with local_size (32, 16, 1).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SsmConvPush {
+    pub nb01: u32,
+    pub nb02: u32,
+    pub nb11: u32,
+    pub dst_nb0: u32,
+    pub dst_nb1: u32,
+    pub dst_nb2: u32,
+    pub nc: u32,
+    pub ncs: u32,
+    pub nr: u32,
+    pub n_t: u32,
+    pub n_s: u32,
+}
+
+impl SsmConvPush {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const _ as *const u8,
+                std::mem::size_of::<SsmConvPush>(),
+            )
+        }
+    }
+}
